@@ -1,0 +1,14 @@
+# Compiled binaries and object files
+*.o
+*.a
+*.so
+*.out
+*.exe
+
+# Stray test/run artifacts from example programs
+*.log
+
+# Editor/OS cruft
+.vscode/
+*.swp
+.DS_Store
