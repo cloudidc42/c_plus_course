@@ -1021,3 +1021,1248 @@ $ curl -s -X POST http://127.0.0.1:18480/auth/login -H "Content-Type: applicatio
 ในทุก request ถัดไป
 
 ---
+
+## 121.5 Catalog API: Category, Product, Filter/Search/Pagination และปัญหา N+1 (Step 965)
+
+### `include/connection_pool.hpp`: เกริ่นนำก่อนเข้ารายละเอียด
+
+`db.cpp` ในหัวข้อนี้จะเรียกใช้ `ConnectionPool` ซึ่งเป็นคลาสที่แก้ปัญหา concurrency bug จริงที่
+เจอระหว่างพัฒนาโปรเจกต์นี้ (รายละเอียดเต็มอยู่ใน 121.6) ในหัวข้อนี้ให้เข้าใจแค่ว่า
+`pool_.acquire()` คืน RAII guard ที่ให้ยืม `pqxx::connection` หนึ่งตัวมาใช้ชั่วคราว แล้วคืนกลับ
+อัตโนมัติเมื่อหมด scope — ใช้งานเหมือนมี `pqxx::connection` ตัวเดียวตรงๆ แทบทุกประการ
+
+### `include/db.hpp`: Data Access Layer เต็มรูปแบบ
+
+```cpp
+#pragma once
+#include <pqxx/pqxx>
+#include <string>
+#include <vector>
+#include <optional>
+#include <stdexcept>
+#include "models.hpp"
+#include "connection_pool.hpp"
+
+// โยน exception ชนิดนี้เมื่อสินค้าตัวใดตัวหนึ่งใน order มีสต็อกไม่พอ
+// route layer จะจับ exception นี้แยกจาก exception ทั่วไป เพื่อคืน 409 Conflict แทน 500
+struct InsufficientStockError : public std::runtime_error {
+    int product_id;
+    std::string product_name;
+    int requested;
+    int available;
+    InsufficientStockError(int pid, std::string pname, int req, int avail)
+        : std::runtime_error("สินค้า \"" + pname + "\" มีไม่พอ (ต้องการ " +
+                              std::to_string(req) + " มีในสต็อก " + std::to_string(avail) + ")"),
+          product_id(pid), product_name(std::move(pname)), requested(req), available(avail) {}
+};
+
+struct ProductNotFoundError : public std::runtime_error {
+    int product_id;
+    explicit ProductNotFoundError(int pid)
+        : std::runtime_error("ไม่พบสินค้า id = " + std::to_string(pid)), product_id(pid) {}
+};
+
+struct OrderLineRequest {
+    int product_id;
+    int quantity;
+};
+
+// รายการค้นหา/กรองสินค้า
+struct ProductQuery {
+    std::optional<int> category_id;
+    std::optional<std::string> search;
+    int page = 1;
+    int limit = 20;
+};
+
+struct ProductPage {
+    std::vector<Product> items;
+    long long total_count = 0;
+    int page = 1;
+    int limit = 20;
+    long long total_pages = 0;
+};
+
+// Db คือชั้น Data Access Layer (Repository) — ห่อหุ้มการคุยกับ PostgreSQL ทั้งหมดผ่าน libpqxx
+// ชั้น routes จะไม่เห็น pqxx::connection หรือ SQL string เลยแม้แต่นิดเดียว
+class Db {
+public:
+    // pool_size คือจำนวน connection ที่เปิดค้างไว้ล่วงหน้า ควรตั้งให้ >= จำนวน worker thread
+    // ของ Crow (ค่า default ของ .multithreaded() คือ std::thread::hardware_concurrency())
+    // เพื่อไม่ให้ request ต้องรอคิวกันเปล่าๆ ทั้งที่ CPU core ยังว่างอยู่
+    explicit Db(const std::string& conn_string, std::size_t pool_size = 8);
+
+    // --- Categories ---
+    std::vector<Category> list_categories();
+
+    // --- Products ---
+    ProductPage list_products(const ProductQuery& q);
+    std::optional<Product> find_product_by_id(int id);
+    Product create_product(int category_id, const std::string& sku, const std::string& name,
+                            const std::string& description, long long price_cents, int stock);
+    bool update_product(int id, const std::string& name, const std::string& description,
+                         long long price_cents, int stock);
+
+    // --- Users ---
+    std::optional<User> create_user(const std::string& username, const std::string& password_hash,
+                                     const std::string& role);
+    std::optional<User> find_user_by_username(const std::string& username);
+
+    // --- Orders (หัวใจของโปรเจกต์: transaction ที่ปลอดภัยต่อ concurrency) ---
+    Order place_order(int user_id, const std::vector<OrderLineRequest>& lines);
+    std::vector<Order> list_orders_by_user(int user_id);
+    std::optional<Order> find_order_by_id(int order_id, int user_id);
+
+private:
+    ConnectionPool pool_;
+
+    Order load_order_with_items(pqxx::work& txn, int order_id);
+};
+```
+
+### `src/db.cpp`: ส่วน Categories และ Products
+
+```cpp
+#include "db.hpp"
+#include <algorithm>
+#include <sstream>
+
+Db::Db(const std::string& conn_string, std::size_t pool_size) : pool_(conn_string, pool_size) {}
+
+// ---------------------------------------------------------------------------
+// Categories
+// ---------------------------------------------------------------------------
+std::vector<Category> Db::list_categories() {
+    auto conn = pool_.acquire();
+    pqxx::work txn(*conn);
+    pqxx::result rows = txn.exec("SELECT id, name, slug FROM categories ORDER BY id;");
+    txn.commit();
+
+    std::vector<Category> result;
+    for (const auto& row : rows) {
+        Category c;
+        c.id = row["id"].as<int>();
+        c.name = row["name"].as<std::string>();
+        c.slug = row["slug"].as<std::string>();
+        result.push_back(c);
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Products
+// ---------------------------------------------------------------------------
+static Product row_to_product(const pqxx::row& row) {
+    Product p;
+    p.id = row["id"].as<int>();
+    p.category_id = row["category_id"].as<int>();
+    p.category_name = row["category_name"].as<std::string>();
+    p.sku = row["sku"].as<std::string>();
+    p.name = row["name"].as<std::string>();
+    p.description = row["description"].as<std::string>();
+    p.price_cents = row["price_cents"].as<long long>();
+    p.stock = row["stock"].as<int>();
+    return p;
+}
+
+ProductPage Db::list_products(const ProductQuery& q) {
+    auto conn = pool_.acquire();
+    pqxx::work txn(*conn);
+
+    // เราต่อ WHERE clause แบบมีเงื่อนไข แต่ "ค่า" ทุกตัวยังคงส่งผ่าน exec_params เสมอ
+    // (ต่อแค่โครงสร้าง SQL ที่เป็นค่าคงที่ ไม่เคยต่อค่าที่มาจากผู้ใช้ตรงๆ)
+    std::string where = "WHERE 1=1";
+    int param_idx = 1;
+    std::vector<std::string> params;
+
+    if (q.category_id.has_value()) {
+        where += " AND p.category_id = $" + std::to_string(param_idx++);
+        params.push_back(std::to_string(*q.category_id));
+    }
+    if (q.search.has_value() && !q.search->empty()) {
+        where += " AND lower(p.name) LIKE lower($" + std::to_string(param_idx++) + ")";
+        params.push_back("%" + *q.search + "%");
+    }
+
+    // นับจำนวนทั้งหมดก่อน (สำหรับ pagination metadata)
+    std::string count_sql = "SELECT COUNT(*) AS cnt FROM products p " + where + ";";
+    pqxx::result count_result;
+    {
+        pqxx::params pp;
+        for (auto& v : params) pp.append(v);
+        count_result = txn.exec_params(count_sql, pp);
+    }
+    long long total_count = count_result[0]["cnt"].as<long long>();
+
+    int page = std::max(1, q.page);
+    int limit = std::max(1, std::min(100, q.limit)); // จำกัดสูงสุด 100 ต่อหน้า ป้องกัน DoS
+    int offset = (page - 1) * limit;
+
+    // เขียนแยกทีละบรรทัดโดยตั้งใจ (ไม่ใช้ param_idx++ สองครั้งในนิพจน์เดียว) เพราะลำดับการ
+    // ประเมินผลของ operator+ ต่อเนื่องกันไม่ได้ถูกกำหนดไว้ตายตัวใน C++ (unsequenced) — ถ้าเขียน
+    // ...+ std::to_string(param_idx++) + ... + std::to_string(param_idx++) ... ในนิพจน์เดียว
+    // คอมไพเลอร์มีสิทธิ์ประเมินฝั่งขวาก่อนฝั่งซ้ายก็ได้ ทำให้ได้เลข placeholder สลับกันโดยไม่รู้ตัว
+    // (ดู Common Pitfalls ข้อ "Sequence Point" ท้ายบท)
+    int limit_placeholder = param_idx++;
+    int offset_placeholder = param_idx++;
+    std::string list_sql =
+        "SELECT p.id, p.category_id, c.name AS category_name, p.sku, p.name, "
+        "       p.description, p.price_cents, p.stock "
+        "FROM products p "
+        "JOIN categories c ON c.id = p.category_id " +
+        where +
+        " ORDER BY p.id "
+        "LIMIT $" + std::to_string(limit_placeholder) +
+        " OFFSET $" + std::to_string(offset_placeholder) + ";";
+    params.push_back(std::to_string(limit));
+    params.push_back(std::to_string(offset));
+
+    pqxx::result rows;
+    {
+        pqxx::params pp;
+        for (auto& v : params) pp.append(v);
+        rows = txn.exec_params(list_sql, pp);
+    }
+    txn.commit();
+
+    ProductPage page_result;
+    for (const auto& row : rows) page_result.items.push_back(row_to_product(row));
+    page_result.total_count = total_count;
+    page_result.page = page;
+    page_result.limit = limit;
+    page_result.total_pages = (total_count + limit - 1) / limit;
+    return page_result;
+}
+
+std::optional<Product> Db::find_product_by_id(int id) {
+    auto conn = pool_.acquire();
+    pqxx::work txn(*conn);
+    pqxx::result rows = txn.exec_params(
+        "SELECT p.id, p.category_id, c.name AS category_name, p.sku, p.name, "
+        "       p.description, p.price_cents, p.stock "
+        "FROM products p JOIN categories c ON c.id = p.category_id "
+        "WHERE p.id = $1;",
+        id
+    );
+    txn.commit();
+    if (rows.empty()) return std::nullopt;
+    return row_to_product(rows[0]);
+}
+
+Product Db::create_product(int category_id, const std::string& sku, const std::string& name,
+                            const std::string& description, long long price_cents, int stock) {
+    auto conn = pool_.acquire();
+    pqxx::work txn(*conn);
+    pqxx::result r = txn.exec_params(
+        "INSERT INTO products (category_id, sku, name, description, price_cents, stock) "
+        "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id;",
+        category_id, sku, name, description, price_cents, stock
+    );
+    txn.commit();
+    int new_id = r[0]["id"].as<int>();
+    return *find_product_by_id(new_id);
+}
+
+bool Db::update_product(int id, const std::string& name, const std::string& description,
+                         long long price_cents, int stock) {
+    auto conn = pool_.acquire();
+    pqxx::work txn(*conn);
+    pqxx::result r = txn.exec_params(
+        "UPDATE products SET name = $1, description = $2, price_cents = $3, stock = $4 "
+        "WHERE id = $5;",
+        name, description, price_cents, stock, id
+    );
+    txn.commit();
+    return r.affected_rows() > 0;
+}
+```
+
+### ทำไม `list_products()` ใช้ `JOIN` แทนที่จะ query แยก: การหลีกเลี่ยงปัญหา N+1
+
+นี่คือจุดสำคัญที่แยกโค้ด production-quality ออกจากโค้ดตัวอย่างทั่วไป ลองจินตนาการถ้าเขียนแบบ
+"ง่ายแต่ผิด" ดังนี้:
+
+```cpp
+// ❌ ตัวอย่างโค้ดที่มีปัญหา N+1 — อย่าทำแบบนี้
+std::vector<Product> list_products_naive() {
+    auto products = query("SELECT * FROM products;");        // Query 1 ครั้ง ได้สินค้า N ตัว
+    for (auto& p : products) {
+        auto cat = query("SELECT name FROM categories WHERE id = " + p.category_id);
+        // ⚠️ Query เพิ่มอีก 1 ครั้งต่อสินค้า 1 ตัว!
+        p.category_name = cat.name;
+    }
+    return products;
+}
+```
+
+ถ้ามีสินค้า 100 ตัว โค้ดข้างต้นจะยิง query ไปที่ฐานข้อมูลทั้งหมด **1 + 100 = 101 ครั้ง** (Query
+แรกดึงสินค้าทั้งหมด บวก Query ที่ N สำหรับดึงชื่อหมวดหมู่ของสินค้าแต่ละตัว) — นี่คือปัญหาที่
+เรียกว่า **N+1 Query Problem** ซึ่งเป็นสาเหตุอันดับต้นๆ ของ API ที่ช้าลงอย่างรุนแรงเมื่อข้อมูล
+มีจำนวนมากขึ้น (Latency ยิ่งเพิ่มตามจำนวนแถวเชิงเส้น ทั้งที่ผู้ใช้แค่อยากได้ "รายการสินค้า 1
+หน้า")
+
+`list_products()` ในโปรเจกต์นี้แก้ปัญหานี้ด้วย **`JOIN` เดียว** ที่ดึงทั้งข้อมูลสินค้าและชื่อ
+หมวดหมู่มาพร้อมกันในเที่ยวเดียว (`FROM products p JOIN categories c ON c.id = p.category_id`)
+ไม่ว่าจะมีสินค้ากี่ตัว ก็ใช้แค่ **1 query เดียวเสมอ** — นี่คือความแตกต่างเชิงคุณภาพระหว่าง
+"เขียนโค้ดให้รันได้" กับ "เขียนโค้ดที่ scale ได้จริงเมื่อข้อมูลโต"
+
+| แนวทาง | จำนวน Query เมื่อมีสินค้า 100 ตัว | จำนวน Query เมื่อมีสินค้า 100,000 ตัว |
+|---|---|---|
+| แยก query ต่อแถว (N+1) | 101 ครั้ง | 100,001 ครั้ง |
+| **JOIN เดียว (ที่ใช้ในบทนี้)** | **1 ครั้ง** | **1 ครั้ง** |
+
+### `src/routes_catalog.cpp`: Endpoint ทั้งหมดของ Category และ Product
+
+```cpp
+#include "routes_catalog.hpp"
+#include "response.hpp"
+#include <nlohmann/json.hpp>
+#include <pqxx/pqxx>
+#include <cstdlib>
+#include <algorithm>
+
+using json = nlohmann::json;
+
+// validate payload สำหรับ POST/PUT /products (ใช้ร่วมกันทั้งสอง endpoint)
+static std::string validate_product_payload(const json& body, bool require_all_fields) {
+    if (require_all_fields && !body.contains("category_id")) return "ต้องมีฟิลด์ \"category_id\"";
+    if (require_all_fields && !body.contains("sku")) return "ต้องมีฟิลด์ \"sku\"";
+    if (require_all_fields && !body.contains("name")) return "ต้องมีฟิลด์ \"name\"";
+    if (require_all_fields && !body.contains("price_cents")) return "ต้องมีฟิลด์ \"price_cents\"";
+    if (require_all_fields && !body.contains("stock")) return "ต้องมีฟิลด์ \"stock\"";
+
+    if (body.contains("category_id") && !body["category_id"].is_number_integer())
+        return "ฟิลด์ \"category_id\" ต้องเป็นจำนวนเต็ม";
+    if (body.contains("sku") && (!body["sku"].is_string() || body["sku"].get<std::string>().empty()))
+        return "ฟิลด์ \"sku\" ต้องเป็น string ที่ไม่ว่าง";
+    if (body.contains("name") && (!body["name"].is_string() || body["name"].get<std::string>().empty()))
+        return "ฟิลด์ \"name\" ต้องเป็น string ที่ไม่ว่าง";
+    if (body.contains("description") && !body["description"].is_string())
+        return "ฟิลด์ \"description\" ต้องเป็น string";
+    if (body.contains("price_cents") &&
+        (!body["price_cents"].is_number_integer() || body["price_cents"].get<long long>() < 0))
+        return "ฟิลด์ \"price_cents\" ต้องเป็นจำนวนเต็มไม่ติดลบ (หน่วยสตางค์)";
+    if (body.contains("stock") &&
+        (!body["stock"].is_number_integer() || body["stock"].get<int>() < 0))
+        return "ฟิลด์ \"stock\" ต้องเป็นจำนวนเต็มไม่ติดลบ";
+    return "";
+}
+
+void register_catalog_routes(crow::App<AuthMiddleware>& app, Db& db) {
+
+    // GET /categories — สาธารณะ ไม่ต้อง login
+    CROW_ROUTE(app, "/categories")
+    .methods(crow::HTTPMethod::GET)
+    ([&db]() {
+        try {
+            auto cats = db.list_categories();
+            json arr = json::array();
+            for (const auto& c : cats) arr.push_back(c.to_json());
+            return api::ok(arr);
+        } catch (const std::exception& e) {
+            return api::error(500, "INTERNAL_ERROR", e.what());
+        }
+    });
+
+    // GET /products — รายการสินค้า (สาธารณะ) พร้อม filter/search/pagination
+    // query params: category_id, search, page, limit
+    CROW_ROUTE(app, "/products")
+    .methods(crow::HTTPMethod::GET)
+    ([&db](const crow::request& req) {
+        try {
+            ProductQuery q;
+            if (const char* cat = req.url_params.get("category_id")) {
+                q.category_id = std::atoi(cat);
+            }
+            if (const char* s = req.url_params.get("search")) {
+                q.search = std::string(s);
+            }
+            if (const char* p = req.url_params.get("page")) {
+                q.page = std::max(1, std::atoi(p));
+            }
+            if (const char* l = req.url_params.get("limit")) {
+                q.limit = std::atoi(l);
+            }
+
+            ProductPage result = db.list_products(q);
+            json arr = json::array();
+            for (const auto& p : result.items) arr.push_back(p.to_json());
+
+            json data{
+                {"items", arr},
+                {"page", result.page},
+                {"limit", result.limit},
+                {"total_count", result.total_count},
+                {"total_pages", result.total_pages}
+            };
+            return api::ok(data);
+        } catch (const std::exception& e) {
+            return api::error(500, "INTERNAL_ERROR", e.what());
+        }
+    });
+
+    // GET /products/<id> — รายละเอียดสินค้าตัวเดียว (สาธารณะ)
+    CROW_ROUTE(app, "/products/<int>")
+    .methods(crow::HTTPMethod::GET)
+    ([&db](int id) {
+        try {
+            auto p = db.find_product_by_id(id);
+            if (!p) {
+                return api::error(404, "PRODUCT_NOT_FOUND", "ไม่พบสินค้า id = " + std::to_string(id));
+            }
+            return api::ok(p->to_json());
+        } catch (const std::exception& e) {
+            return api::error(500, "INTERNAL_ERROR", e.what());
+        }
+    });
+
+    // POST /products — สร้างสินค้าใหม่ (admin เท่านั้น)
+    CROW_ROUTE(app, "/products")
+    .methods(crow::HTTPMethod::POST)
+    .CROW_MIDDLEWARES(app, AuthMiddleware)
+    ([&app, &db](const crow::request& req) {
+        auto& ctx = app.get_context<AuthMiddleware>(req);
+        if (ctx.role != "admin") {
+            return api::error(403, "FORBIDDEN", "เฉพาะผู้ดูแลระบบ (admin) เท่านั้นที่สร้างสินค้าได้");
+        }
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const json::parse_error&) {
+            return api::error(400, "INVALID_JSON", "Body ไม่ใช่ JSON ที่ถูกต้อง");
+        }
+        if (!body.is_object()) {
+            return api::error(400, "INVALID_JSON", "Body ต้องเป็น JSON object");
+        }
+        std::string err = validate_product_payload(body, /*require_all_fields=*/true);
+        if (!err.empty()) {
+            return api::error(400, "VALIDATION_ERROR", err);
+        }
+
+        try {
+            Product created = db.create_product(
+                body["category_id"].get<int>(),
+                body["sku"].get<std::string>(),
+                body["name"].get<std::string>(),
+                body.value("description", ""),
+                body["price_cents"].get<long long>(),
+                body["stock"].get<int>()
+            );
+            return api::ok(created.to_json(), 201);
+        } catch (const pqxx::foreign_key_violation&) {
+            return api::error(400, "INVALID_CATEGORY", "ไม่พบ category_id ที่ระบุ");
+        } catch (const pqxx::unique_violation&) {
+            return api::error(409, "SKU_TAKEN", "sku นี้ถูกใช้ไปแล้ว");
+        } catch (const std::exception& e) {
+            return api::error(500, "INTERNAL_ERROR", e.what());
+        }
+    });
+
+    // PUT /products/<id> — แก้ไขสินค้า (admin เท่านั้น) — partial update
+    CROW_ROUTE(app, "/products/<int>")
+    .methods(crow::HTTPMethod::PUT)
+    .CROW_MIDDLEWARES(app, AuthMiddleware)
+    ([&app, &db](const crow::request& req, int id) {
+        auto& ctx = app.get_context<AuthMiddleware>(req);
+        if (ctx.role != "admin") {
+            return api::error(403, "FORBIDDEN", "เฉพาะผู้ดูแลระบบ (admin) เท่านั้นที่แก้ไขสินค้าได้");
+        }
+
+        auto existing = db.find_product_by_id(id);
+        if (!existing) {
+            return api::error(404, "PRODUCT_NOT_FOUND", "ไม่พบสินค้า id = " + std::to_string(id));
+        }
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const json::parse_error&) {
+            return api::error(400, "INVALID_JSON", "Body ไม่ใช่ JSON ที่ถูกต้อง");
+        }
+        if (!body.is_object()) {
+            return api::error(400, "INVALID_JSON", "Body ต้องเป็น JSON object");
+        }
+        std::string err = validate_product_payload(body, /*require_all_fields=*/false);
+        if (!err.empty()) {
+            return api::error(400, "VALIDATION_ERROR", err);
+        }
+
+        try {
+            std::string name = body.value("name", existing->name);
+            std::string description = body.value("description", existing->description);
+            long long price_cents = body.value("price_cents", existing->price_cents);
+            int stock = body.value("stock", existing->stock);
+            db.update_product(id, name, description, price_cents, stock);
+            auto updated = db.find_product_by_id(id);
+            return api::ok(updated->to_json());
+        } catch (const std::exception& e) {
+            return api::error(500, "INTERNAL_ERROR", e.what());
+        }
+    });
+}
+```
+
+จุดที่ควรสังเกตเป็นพิเศษ: การ catch `pqxx::foreign_key_violation` และ `pqxx::unique_violation`
+แยกจาก `std::exception` ทั่วไป — libpqxx แปล PostgreSQL error code (เช่น `23503` สำหรับ foreign
+key violation, `23505` สำหรับ unique violation) เป็น exception class เฉพาะให้อัตโนมัติ ทำให้
+เราแปล error ของฐานข้อมูลเป็น HTTP status code ที่ถูกต้องได้โดยไม่ต้อง parse error message
+เป็น string เอง (ซึ่งเปราะบางกว่ามากถ้า PostgreSQL เปลี่ยนข้อความ error ในเวอร์ชันใหม่)
+
+---
+
+## 121.6 Orders: Transaction ที่ปลอดภัยต่อ Concurrency (หัวใจของโปรเจกต์) (Step 966)
+
+นี่คือหัวข้อที่สำคัญที่สุดของทั้ง Capstone — ทุกอย่างที่เรียนมาตั้งแต่ต้น Part นี้ (schema
+design, layered architecture, RBAC) เป็นแค่ "โครงสร้างรองรับ" ให้กับปัญหาแกนกลางข้อเดียว:
+**ทำอย่างไรให้การสั่งซื้อสินค้าถูกต้อง 100% แม้มีลูกค้าหลายคนสั่งซื้อสินค้าตัวเดียวกันพร้อมกัน**
+
+### ทำความเข้าใจ Race Condition ด้วยภาพ
+
+ลองจินตนาการสินค้าตัวหนึ่งมี `stock = 1` (เหลือชิ้นสุดท้าย) และมีลูกค้า 2 คนกด "สั่งซื้อ" ในเวลา
+ใกล้เคียงกันมากจนสอง request ถูกประมวลผลพร้อมกัน ถ้าเขียนโค้ดแบบ "เช็คก่อนแล้วค่อยลด"
+(Check-Then-Act) โดยไม่ป้องกันอะไรเลย จะเกิดสถานการณ์นี้:
+
+```
+เวลา     Thread A (ลูกค้า 1)              Thread B (ลูกค้า 2)
+──────────────────────────────────────────────────────────────
+t1       SELECT stock FROM products
+         WHERE id=5;  -> ได้ stock=1
+t2                                        SELECT stock FROM products
+                                          WHERE id=5;  -> ได้ stock=1
+t3       ตรวจ: 1 >= 1 (พอ) ✓
+t4                                        ตรวจ: 1 >= 1 (พอ) ✓
+t5       UPDATE stock = stock - 1
+         (stock กลายเป็น 0)
+t6                                        UPDATE stock = stock - 1
+                                          (stock กลายเป็น -1) ⚠️ ติดลบ!
+```
+
+ทั้งสอง Thread อ่านค่า `stock = 1` **ก่อน** ที่ฝั่งใดฝั่งหนึ่งจะเขียนค่าลดลง ทำให้ทั้งคู่คิดว่า
+"มีของพอ" และปล่อยให้คำสั่งซื้อผ่านทั้งสองรายการ ผลคือร้านค้าขายสินค้าที่ไม่มีอยู่จริงออกไป
+(Overselling) — นี่คือ **Race Condition** แบบคลาสสิกที่เรียกว่า **Check-Then-Act** race
+(ทบทวนแนวคิดพื้นฐานของ Race Condition จาก Part 73 เรื่อง Concurrency ใน C++)
+
+### ทางแก้: `SELECT ... FOR UPDATE`
+
+PostgreSQL มีกลไก **Row-Level Locking** ที่แก้ปัญหานี้ได้โดยตรงผ่านคำสั่ง
+`SELECT ... FOR UPDATE` — เมื่อ transaction หนึ่งอ่านแถวด้วยคำสั่งนี้ PostgreSQL จะ **ล็อกแถว
+นั้นไว้ทันที** ไม่ให้ transaction อื่นอ่านแบบ `FOR UPDATE` แถวเดียวกันได้จนกว่า transaction แรก
+จะ `COMMIT` หรือ `ROLLBACK` — transaction ที่สองจะ**ต้องรอ** (block) ไม่ใช่ผ่านไปพร้อมกันแบบ
+ในภาพด้านบน
+
+```
+เวลา     Thread A (ลูกค้า 1)                       Thread B (ลูกค้า 2)
+────────────────────────────────────────────────────────────────────────
+t1       BEGIN;
+t2       SELECT stock FROM products
+         WHERE id=5 FOR UPDATE;  -> stock=1
+         (แถวนี้ถูกล็อกแล้ว)
+t3                                                 BEGIN;
+t4                                                 SELECT stock FROM products
+                                                    WHERE id=5 FOR UPDATE;
+                                                    -> ⏸ ต้องรอ! (แถวถูกล็อกอยู่)
+t5       ตรวจ: 1 >= 1 (พอ) ✓
+t6       UPDATE stock = stock - 1;  (stock=0)
+t7       COMMIT;  (ปลดล็อก)
+t8                                                 -> ตื่นจากการรอ ได้ stock=0 (ค่าล่าสุดหลัง commit)
+t9                                                 ตรวจ: 0 >= 1 (ไม่พอ!) ✗
+t10                                                ROLLBACK; คืน 409 INSUFFICIENT_STOCK
+```
+
+Thread B ไม่ได้อ่านค่า stock "เก่า" (`1`) แต่ต้องรอจน Thread A ทำงานเสร็จและ commit ก่อน แล้ว
+จึงอ่านค่า **ล่าสุดที่แท้จริง** (`0`) ทำให้ตรวจพบว่าสินค้าหมดได้อย่างถูกต้อง — นี่คือหลักการ
+เดียวกับที่แบบฝึกหัดข้อ 3 ของ Part 106 ใช้แก้ปัญหาการโอนเงินระหว่างบัญชี (`transfer_money`)
+เพียงแต่ตอนนี้เราขยายให้ทำงานกับสินค้าหลายรายการในคำสั่งซื้อเดียว
+
+### ทำไมต้องเรียง `product_id` ก่อนล็อกเสมอ: ป้องกัน Deadlock
+
+เมื่อคำสั่งซื้อหนึ่งใบมีสินค้าหลายรายการ (เช่น สั่งทั้งสินค้า id=6 และ id=7 พร้อมกัน) จะต้องล็อก
+หลายแถวในคำสั่งซื้อเดียว ถ้าลูกค้าสองคนสั่งสินค้าชุดเดียวกันแต่ **ส่งลำดับ item ในคนละแบบ**
+กัน (คนแรกส่ง `[6, 7]` คนที่สองส่ง `[7, 6]`) แล้วเราล็อกตามลำดับที่ client ส่งมาตรงๆ อาจเกิด
+**Deadlock**:
+
+```
+เวลา     Order A (items: [6, 7])            Order B (items: [7, 6])
+──────────────────────────────────────────────────────────────────
+t1       ล็อกสินค้า id=6 สำเร็จ
+t2                                          ล็อกสินค้า id=7 สำเร็จ
+t3       พยายามล็อกสินค้า id=7
+         -> ต้องรอ Order B ปล่อยล็อก
+t4                                          พยายามล็อกสินค้า id=6
+                                            -> ต้องรอ Order A ปล่อยล็อก
+         ⚠️ ทั้งสองฝั่งรอกันไปมาไม่มีวันจบ (Deadlock)
+```
+
+PostgreSQL มีกลไกตรวจจับ deadlock อัตโนมัติและจะยกเลิก transaction ใดตัวหนึ่งด้วย error
+`deadlock detected` แต่นั่นก็แปลว่า order ของลูกค้าคนหนึ่งล้มเหลวไปโดยไม่จำเป็น ทางแก้ที่ถูกต้อง
+คือ **บังคับให้ทุก transaction ล็อกทรัพยากรตามลำดับเดียวกันเสมอ** ไม่ว่า client จะส่งลำดับ
+มาแบบไหนก็ตาม — ในโค้ดของเราคือการ `std::sort` รายการสินค้าตาม `product_id` ก่อนวนล็อกเสมอ
+ทำให้ทั้ง Order A และ Order B ล็อกตามลำดับ `6` ก่อน `7` เสมอ ไม่มีทางเกิดการรอกันเป็นวงกลมได้อีก
+ต่อไป
+
+### `src/db.cpp`: `place_order()` เต็มรูปแบบ
+
+```cpp
+// ---------------------------------------------------------------------------
+// Orders — จุดที่สำคัญที่สุดของทั้งโปรเจกต์: transaction ที่ปลอดภัยต่อ concurrency
+// ---------------------------------------------------------------------------
+Order Db::place_order(int user_id, const std::vector<OrderLineRequest>& lines) {
+    auto conn = pool_.acquire();
+    pqxx::work txn(*conn);
+
+    // ---- ขั้นตอนที่ 1: เรียง product_id จากน้อยไปมากก่อนล็อกเสมอ ----
+    // เหตุผล: ถ้า order A ล็อก (1,2) และ order B ล็อก (2,1) พร้อมกันโดยไม่เรียงลำดับ
+    // อาจเกิด deadlock ได้ (แต่ละฝั่งถือ lock ของอีกฝั่งต้องการ รอกันไปมาไม่จบ)
+    // การบังคับล็อกตามลำดับ id เดียวกันเสมอทำให้ไม่มีทางเกิด deadlock แบบวนรอบได้เลย
+    std::vector<OrderLineRequest> sorted_lines = lines;
+    std::sort(sorted_lines.begin(), sorted_lines.end(),
+              [](const OrderLineRequest& a, const OrderLineRequest& b) {
+                  return a.product_id < b.product_id;
+              });
+
+    long long total_cents = 0;
+    std::vector<OrderItemLine> item_lines;
+
+    // ---- ขั้นตอนที่ 2: ล็อกแถวสินค้าทุกตัวด้วย SELECT ... FOR UPDATE ----
+    // FOR UPDATE บอก PostgreSQL ว่า "ห้าม transaction อื่นแตะแถวนี้จนกว่าเราจะ commit/rollback"
+    // นี่คือกลไกที่ป้องกัน race condition ตอนเช็ค-แล้ว-ลด stock (check-then-act)
+    for (const auto& line : sorted_lines) {
+        pqxx::result rows = txn.exec_params(
+            "SELECT id, name, price_cents, stock FROM products WHERE id = $1 FOR UPDATE;",
+            line.product_id
+        );
+        if (rows.empty()) {
+            throw ProductNotFoundError(line.product_id);
+        }
+        int current_stock = rows[0]["stock"].as<int>();
+        std::string pname = rows[0]["name"].as<std::string>();
+        long long price = rows[0]["price_cents"].as<long long>();
+
+        if (current_stock < line.quantity) {
+            // txn จะ rollback อัตโนมัติเมื่อ exception หลุดออกจากฟังก์ชันนี้ (destructor ของ pqxx::work)
+            throw InsufficientStockError(line.product_id, pname, line.quantity, current_stock);
+        }
+
+        // ---- ขั้นตอนที่ 3: ลด stock ทันทีในทรานแซกชันเดียวกัน (ยังไม่ commit) ----
+        txn.exec_params(
+            "UPDATE products SET stock = stock - $1 WHERE id = $2;",
+            line.quantity, line.product_id
+        );
+
+        OrderItemLine oil;
+        oil.product_id = line.product_id;
+        oil.product_name = pname;
+        oil.quantity = line.quantity;
+        oil.unit_price_cents = price;
+        item_lines.push_back(oil);
+        total_cents += price * line.quantity;
+    }
+
+    // ---- ขั้นตอนที่ 4: สร้าง order + order_items ----
+    pqxx::result order_row = txn.exec_params(
+        "INSERT INTO orders (user_id, status, total_cents) VALUES ($1, 'placed', $2) RETURNING id, created_at;",
+        user_id, total_cents
+    );
+    int order_id = order_row[0]["id"].as<int>();
+
+    for (const auto& oil : item_lines) {
+        txn.exec_params(
+            "INSERT INTO order_items (order_id, product_id, quantity, unit_price_cents) "
+            "VALUES ($1, $2, $3, $4);",
+            order_id, oil.product_id, oil.quantity, oil.unit_price_cents
+        );
+    }
+
+    // ---- ขั้นตอนที่ 5: commit ทั้งหมดในครั้งเดียว ----
+    // ถ้า process ล่มก่อนบรรทัดนี้ (ไฟดับ, exception) transaction ทั้งก้อนจะถูก rollback
+    // stock ที่ลดไปตอน SELECT...FOR UPDATE + UPDATE ข้างต้นจะกลับคืนสภาพเดิมโดยอัตโนมัติ
+    txn.commit();
+
+    Order order;
+    order.id = order_id;
+    order.user_id = user_id;
+    order.status = "placed";
+    order.total_cents = total_cents;
+    order.created_at = order_row[0]["created_at"].as<std::string>();
+    order.items = item_lines;
+    return order;
+}
+```
+
+ทุกขั้นตอน (ล็อก → ตรวจสอบ → ลด stock → สร้าง order → สร้าง order_items → commit) อยู่ใน
+**transaction เดียว** (`pqxx::work txn`) — ถ้าขั้นตอนใดขั้นตอนหนึ่งล้มเหลว (สินค้าไม่พอ, สินค้า
+ไม่มีอยู่จริง, connection หลุด) exception จะทำให้ `txn` ถูกทำลายโดยไม่ได้ `commit()` และ
+PostgreSQL จะ **rollback ทุกอย่างที่ทำไปในทรานแซกชันนี้กลับสู่สภาพเดิมโดยอัตโนมัติ** (หลักการ
+เดียวกับที่อธิบายไว้ใน Part 106.6 เรื่องการลืม commit) — นี่คือเหตุผลที่คำสั่งซื้อที่ล้มเหลวไม่
+ทำให้ stock ของสินค้าตัวอื่นในออเดอร์เดียวกันถูกลดไปครึ่งๆ กลางๆ
+
+`load_order_with_items()` (ใช้ร่วมกันระหว่าง `list_orders_by_user()` และ `find_order_by_id()`)
+และ `list_orders_by_user()`/`find_order_by_id()` เต็มรูปแบบ:
+
+```cpp
+Order Db::load_order_with_items(pqxx::work& txn, int order_id) {
+    pqxx::result order_rows = txn.exec_params(
+        "SELECT id, user_id, status, total_cents, created_at FROM orders WHERE id = $1;",
+        order_id
+    );
+    Order order;
+    order.id = order_rows[0]["id"].as<int>();
+    order.user_id = order_rows[0]["user_id"].as<int>();
+    order.status = order_rows[0]["status"].as<std::string>();
+    order.total_cents = order_rows[0]["total_cents"].as<long long>();
+    order.created_at = order_rows[0]["created_at"].as<std::string>();
+
+    pqxx::result item_rows = txn.exec_params(
+        "SELECT oi.product_id, p.name AS product_name, oi.quantity, oi.unit_price_cents "
+        "FROM order_items oi JOIN products p ON p.id = oi.product_id "
+        "WHERE oi.order_id = $1 ORDER BY oi.id;",
+        order_id
+    );
+    for (const auto& row : item_rows) {
+        OrderItemLine oil;
+        oil.product_id = row["product_id"].as<int>();
+        oil.product_name = row["product_name"].as<std::string>();
+        oil.quantity = row["quantity"].as<int>();
+        oil.unit_price_cents = row["unit_price_cents"].as<long long>();
+        order.items.push_back(oil);
+    }
+    return order;
+}
+
+std::vector<Order> Db::list_orders_by_user(int user_id) {
+    auto conn = pool_.acquire();
+    pqxx::work txn(*conn);
+    pqxx::result rows = txn.exec_params(
+        "SELECT id FROM orders WHERE user_id = $1 ORDER BY id DESC;", user_id
+    );
+    std::vector<Order> orders;
+    for (const auto& row : rows) {
+        orders.push_back(load_order_with_items(txn, row["id"].as<int>()));
+    }
+    txn.commit();
+    return orders;
+}
+
+std::optional<Order> Db::find_order_by_id(int order_id, int user_id) {
+    auto conn = pool_.acquire();
+    pqxx::work txn(*conn);
+    pqxx::result check = txn.exec_params(
+        "SELECT id FROM orders WHERE id = $1 AND user_id = $2;", order_id, user_id
+    );
+    if (check.empty()) {
+        txn.commit();
+        return std::nullopt;
+    }
+    Order order = load_order_with_items(txn, order_id);
+    txn.commit();
+    return order;
+}
+```
+
+สังเกตว่า `find_order_by_id()` เช็ค `WHERE id = $1 AND user_id = $2` **ในคำสั่งเดียว** แทนที่
+จะ query แค่ `id` แล้วเอามาเช็ค `user_id` ทีหลังในโค้ด C++ — นี่คือแพทเทิร์นความปลอดภัยที่สำคัญ
+มาก เพราะทำให้ **ฐานข้อมูลเป็นผู้บังคับกฎ "ownership" ให้เราโดยตรง** ไม่มีทางที่บั๊กใน C++ (เช่น
+ลืมเช็ค `if` เงื่อนไข) จะทำให้ผู้ใช้คนหนึ่งเห็นข้อมูล order ของอีกคนหลุดออกไปได้เลย
+
+`src/routes_orders.cpp` — Route layer ที่แปล exception จาก DAL เป็น HTTP status code ที่ถูกต้อง:
+
+```cpp
+#include "routes_orders.hpp"
+#include "response.hpp"
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+
+// validate body ของ POST /orders: {"items":[{"product_id":1,"quantity":2}, ...]}
+static std::string validate_order_payload(const json& body, std::vector<OrderLineRequest>& out) {
+    if (!body.contains("items") || !body["items"].is_array() || body["items"].empty()) {
+        return "ต้องมีฟิลด์ \"items\" เป็น array ที่ไม่ว่าง";
+    }
+    for (const auto& item : body["items"]) {
+        if (!item.is_object() || !item.contains("product_id") || !item.contains("quantity")) {
+            return "แต่ละรายการใน \"items\" ต้องมี \"product_id\" และ \"quantity\"";
+        }
+        if (!item["product_id"].is_number_integer() || item["product_id"].get<int>() <= 0) {
+            return "\"product_id\" ต้องเป็นจำนวนเต็มบวก";
+        }
+        if (!item["quantity"].is_number_integer() || item["quantity"].get<int>() <= 0) {
+            return "\"quantity\" ต้องเป็นจำนวนเต็มบวก";
+        }
+        out.push_back(OrderLineRequest{item["product_id"].get<int>(), item["quantity"].get<int>()});
+    }
+    return "";
+}
+
+void register_order_routes(crow::App<AuthMiddleware>& app, Db& db) {
+
+    // POST /orders — สั่งซื้อ (ต้อง login) หัวใจของระบบ: ตรวจ+ลด stock แบบ atomic ในทรานแซกชันเดียว
+    CROW_ROUTE(app, "/orders")
+    .methods(crow::HTTPMethod::POST)
+    .CROW_MIDDLEWARES(app, AuthMiddleware)
+    ([&app, &db](const crow::request& req) {
+        auto& ctx = app.get_context<AuthMiddleware>(req);
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const json::parse_error&) {
+            return api::error(400, "INVALID_JSON", "Body ไม่ใช่ JSON ที่ถูกต้อง");
+        }
+        if (!body.is_object()) {
+            return api::error(400, "INVALID_JSON", "Body ต้องเป็น JSON object");
+        }
+
+        std::vector<OrderLineRequest> lines;
+        std::string err = validate_order_payload(body, lines);
+        if (!err.empty()) {
+            return api::error(400, "VALIDATION_ERROR", err);
+        }
+
+        try {
+            Order order = db.place_order(ctx.user_id, lines);
+            return api::ok(order.to_json(), 201);
+        } catch (const InsufficientStockError& e) {
+            // 409 Conflict: คำขอขัดแย้งกับสถานะปัจจุบันของทรัพยากร (สินค้าในสต็อกไม่พอ)
+            return api::error(409, "INSUFFICIENT_STOCK", e.what());
+        } catch (const ProductNotFoundError& e) {
+            return api::error(400, "PRODUCT_NOT_FOUND", e.what());
+        } catch (const std::exception& e) {
+            return api::error(500, "INTERNAL_ERROR", e.what());
+        }
+    });
+
+    // GET /orders — ประวัติการสั่งซื้อของผู้ใช้ที่ login อยู่เท่านั้น (ต้อง login)
+    CROW_ROUTE(app, "/orders")
+    .methods(crow::HTTPMethod::GET)
+    .CROW_MIDDLEWARES(app, AuthMiddleware)
+    ([&app, &db](const crow::request& req) {
+        auto& ctx = app.get_context<AuthMiddleware>(req);
+        try {
+            auto orders = db.list_orders_by_user(ctx.user_id);
+            json arr = json::array();
+            for (const auto& o : orders) arr.push_back(o.to_json());
+            return api::ok(arr);
+        } catch (const std::exception& e) {
+            return api::error(500, "INTERNAL_ERROR", e.what());
+        }
+    });
+
+    // GET /orders/<id> — รายละเอียด order เดียว (ต้องเป็นเจ้าของ order เท่านั้น)
+    CROW_ROUTE(app, "/orders/<int>")
+    .methods(crow::HTTPMethod::GET)
+    .CROW_MIDDLEWARES(app, AuthMiddleware)
+    ([&app, &db](const crow::request& req, int id) {
+        auto& ctx = app.get_context<AuthMiddleware>(req);
+        try {
+            auto order = db.find_order_by_id(id, ctx.user_id);
+            if (!order) {
+                // จงใจคืน 404 (ไม่ใช่ 403) ไม่ว่า order จะไม่มีอยู่จริง หรือมีแต่เป็นของคนอื่น
+                // เพื่อไม่ให้ผู้ใช้เดา id ของ order คนอื่นแล้วรู้ได้ว่า id นั้น "มีอยู่จริง"
+                return api::error(404, "ORDER_NOT_FOUND", "ไม่พบ order id = " + std::to_string(id));
+            }
+            return api::ok(order->to_json());
+        } catch (const std::exception& e) {
+            return api::error(500, "INTERNAL_ERROR", e.what());
+        }
+    });
+}
+```
+
+---
+
+## 121.7 บั๊ก Concurrency จริงที่เจอระหว่างพัฒนา และการแก้ด้วย Connection Pool (Step 967)
+
+หัวข้อนี้คือส่วนที่ตรงไปตรงมาที่สุดของทั้งบทเรียน — มันคือเรื่องราวของบั๊กจริงที่เกิดขึ้นจริง
+ระหว่างพัฒนาโปรเจกต์นี้ ไม่ใช่ตัวอย่างที่แต่งขึ้นมาสอน ผู้เขียนบทเรียนนี้เขียนโค้ด `Db` เวอร์ชัน
+แรกให้ถือ `pqxx::connection conn_` เป็นสมาชิกตัวเดียว (แบบเดียวกับที่ Part 108 ทำกับ
+`sqlite3* conn_`) แล้วรันการทดสอบ concurrency ตามที่วางแผนไว้ — ผลลัพธ์คือระบบพังจริง
+
+### ขั้นที่ 1: เขียนโค้ดเวอร์ชันแรก (มีบั๊กซ่อนอยู่)
+
+โค้ดเวอร์ชันแรกของ `Db` เหมือนกับที่แสดงในหัวข้อ 121.5–121.6 ทุกประการ **ยกเว้น** ส่วนเดียวคือ
+สมาชิกส่วนตัว:
+
+```cpp
+// ❌ เวอร์ชันแรก (มีบั๊ก) — เหมือน Part 108 ทุกประการ แต่ต่างฐานข้อมูล
+class Db {
+    // ...
+private:
+    pqxx::connection conn_;   // connection ตัวเดียว แชร์กันทุก request
+};
+
+Db::Db(const std::string& conn_string) : conn_(conn_string) {}
+
+// ทุกเมธอดเรียก pqxx::work txn(conn_); ตรงๆ
+```
+
+โค้ดนี้ **compile ผ่านสะอาด ไม่มี warning** และทำงานถูกต้อง 100% เมื่อทดสอบทีละ request ด้วย
+`curl` (ทุกอย่างในหัวข้อ 121.1–121.6 ผ่านหมด) — นี่คือจุดที่อันตรายที่สุดของบั๊กประเภทนี้: **มัน
+ไม่มีทางถูกจับได้เลยถ้าไม่ทดสอบภายใต้ concurrent load จริง**
+
+### ขั้นที่ 2: ยิง Concurrent Request จริงเพื่อทดสอบ — ระบบพัง
+
+สร้างสินค้า "limited edition" ที่มี `stock = 10` แล้วยิง `POST /orders` พร้อมกัน 30 request
+(คนละ 1 ชิ้น) ด้วย `xargs -P`:
+
+```bash
+#!/bin/bash
+# concurrency_test.sh
+source /tmp/tokens.env
+BASE="http://127.0.0.1:18480"
+PRODUCT_ID=5
+N=30
+
+order_once() {
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST "$BASE/orders" \
+        -H "Authorization: Bearer $CUST_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"items\":[{\"product_id\":$PRODUCT_ID,\"quantity\":1}]}"
+}
+export -f order_once
+export BASE CUST_TOKEN PRODUCT_ID
+
+seq 1 "$N" | xargs -P "$N" -I{} bash -c order_once > /tmp/concurrency_results.txt
+sort /tmp/concurrency_results.txt | uniq -c
+```
+
+ผลลัพธ์จริงจากการรันครั้งแรก (ก่อนแก้บั๊ก):
+
+```
+$ ./concurrency_test.sh
+ยิง 30 คำขอ POST /orders พร้อมกัน (แข่งกันซื้อสินค้า id=5 ที่มี stock เริ่มต้น = 10)...
+--- สรุปผลลัพธ์ HTTP status code จากทั้ง 30 คำขอ ---
+     10 201
+      4 409
+     16 500
+สำเร็จ (201): 10 ครั้ง
+ถูกปฏิเสธเพราะสต็อกไม่พอ (409): 4 ครั้ง
+```
+
+**16 จาก 30 request คืน `500 Internal Server Error`** — ผิดปกติทันที (ที่ถูกต้องควรมีแค่ `201`
+กับ `409` เท่านั้น ไม่ควรมี `500` เลย) ตรวจสอบ log ของ server เพิ่มเติม:
+
+```
+(2026-09-26) [INFO] Request: ... HTTP/1.1 POST /orders
+(2026-09-26) [INFO] Response: ... /orders 500 0
+(2026-09-26) [INFO] Request: ... HTTP/1.1 POST /orders
+(2026-09-26) [INFO] Response: ... /orders 500 0
+...
+```
+
+และเมื่อลอง `curl` เรียกดูสินค้าตัวเดิมหลังจากนั้น:
+
+```bash
+$ curl -s http://127.0.0.1:18480/products/5
+{"error":{"code":"INTERNAL_ERROR","message":"Lost connection to the database server."},"success":false}
+```
+
+**connection ทั้งตัวพังไปเลย** — แม้แต่ `GET` ธรรมดาที่ไม่เกี่ยวกับการสั่งซื้อก็ใช้ไม่ได้อีกต่อไป
+จนกว่าจะ restart server ใหม่ นี่คือสัญญาณชัดเจนว่าปัญหาไม่ใช่แค่ business logic ผิด แต่เป็นปัญหา
+ระดับ connection/protocol ที่เสียหายจริง
+
+### ขั้นที่ 3: วินิจฉัยสาเหตุที่แท้จริง
+
+**`pqxx::connection` ไม่ใช่ thread-safe** — นี่คือข้อเท็จจริงที่ต้องเข้าใจให้ชัดเจน และมันคือ
+**ความแตกต่างที่สำคัญที่สุดข้อหนึ่งระหว่าง libpqxx กับ SQLite** ที่เรียนไปใน Part 108:
+
+| ประเด็น | `sqlite3*` (Part 108) | `pqxx::connection` (Capstone นี้) |
+|---|---|---|
+| Thread-safety ของ connection เดียว | **ปลอดภัย** เมื่อคอมไพล์แบบ `SQLITE_THREADSAFE=1` (Serialized mode — ค่า default บน Ubuntu/Debian) | **ไม่ปลอดภัย** — libpqxx ไม่มี mutex ป้องกันภายในให้ |
+| สิ่งที่เกิดขึ้นถ้าหลาย thread ใช้ connection เดียวพร้อมกัน | SQLite คิว request ให้อัตโนมัติ (ช้าลงแต่ไม่พัง) | **Protocol state ของ PostgreSQL wire protocol เสียหาย** เพราะสอง thread เขียน/อ่าน socket เดียวกันสลับกันแบบไม่ประสานงาน |
+| อาการที่เจอจริงเมื่อพัง | ไม่มี (ปลอดภัยโดย design) | `Lost connection to the database server`, error ที่คาดเดาไม่ได้, บาง request ค้าง |
+
+Crow ทำงานแบบ `.multithreaded()` โดย default (ใช้ `std::thread::hardware_concurrency()` = 4
+thread บนเครื่องนี้) เราสร้าง `Db db(conn_string);` เพียงครั้งเดียวใน `main()` แล้วส่ง
+**reference เดียวกัน** ให้ทุก route handler ใช้ร่วมกัน (ตามแพทเทิร์นเดียวกับ Part 108 ทุกประการ)
+— เมื่อ 4 worker thread ของ Crow ประมวลผล `POST /orders` พร้อมกัน 4 คำขอ ทั้ง 4 thread เรียก
+`pqxx::work txn(conn_);` บน **connection object เดียวกัน** พร้อมกัน แต่ละ thread พยายามส่ง
+คำสั่ง SQL ผ่าน socket เดียวกันในเวลาเดียวกัน ทำให้ byte stream ของ PostgreSQL wire protocol
+ปนกันจนอ่านไม่ออก — เมื่อ protocol เสียหายขนาดนี้ PostgreSQL server ก็ปิด connection ทิ้ง
+(สอดคล้องกับข้อความ "Lost connection to the database server" ที่เห็น)
+
+> **บทเรียนสำคัญที่สุดของหัวข้อนี้**: อย่าสมมติว่า pattern ที่ปลอดภัยกับ library หนึ่ง (SQLite ใน
+> Part 108) จะปลอดภัยกับ library อื่นโดยอัตโนมัติ (libpqxx ในบทนี้) แม้ทั้งคู่จะเป็น "database
+> driver" เหมือนกัน แต่ threading guarantee ของแต่ละ library ต้องตรวจสอบเอกสารแยกกันเสมอ ห้าม
+> เดา
+
+### ขั้นที่ 4: แก้ปัญหาด้วย Connection Pool ที่ Thread-Safe จริง
+
+ทางแก้คือให้แต่ละ request "ยืม" connection ของตัวเองจาก pool ระหว่างทำงาน ไม่มี thread สอง
+ตัวแตะ connection เดียวกันพร้อมกันเด็ดขาด — สร้างคลาส `ConnectionPool` ต่อยอดจากแนวคิด
+`SimpleConnectionPool` ของ Part 106.7 แต่เพิ่ม **mutex + condition_variable** ให้ thread-safe
+จริง (Part 106.7 บอกไว้ชัดเจนแล้วว่าตัวอย่างเดิม "ยังไม่ thread-safe เต็มรูปแบบ เพื่อการสาธิต
+เท่านั้น" — Capstone นี้คือจุดที่ต้องทำให้สมบูรณ์จริง)
+
+`include/connection_pool.hpp`:
+
+```cpp
+#pragma once
+#include <pqxx/pqxx>
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <vector>
+#include <string>
+
+// ---------------------------------------------------------------------------
+// ConnectionPool — pool ของ pqxx::connection ที่ thread-safe จริง
+//
+// เหตุผลที่ต้องมีคลาสนี้: pqxx::connection ตัวเดียว **ไม่ใช่ thread-safe** ต่างจาก
+// sqlite3* ใน Part 108 ที่ SQLite คอมไพล์มาแบบ SERIALIZED (มี mutex ในตัวป้องกันให้
+// อัตโนมัติ) ถ้าหลาย thread ของ Crow (.multithreaded()) เรียกเมธอดของ connection เดียวกัน
+// พร้อมกัน จะเกิด corruption ของ protocol state กับ PostgreSQL ทันที (อาการจริงที่เจอ:
+// "Lost connection to the database server" และ error อื่นๆ ที่คาดเดาไม่ได้ — ดู 121.7)
+//
+// ทางแก้คือให้แต่ละ "งาน" (request handler หนึ่งครั้ง) ยืม connection ของตัวเองจาก pool
+// ระหว่างการยืม ไม่มี thread อื่นแตะ connection ตัวนั้นเลย เมื่องานเสร็จ (guard หมด scope)
+// connection จะถูกคืนกลับ pool โดยอัตโนมัติผ่าน RAII
+// ---------------------------------------------------------------------------
+class ConnectionPool {
+public:
+    ConnectionPool(const std::string& conn_string, std::size_t size) {
+        for (std::size_t i = 0; i < size; ++i) {
+            available_.push_back(std::make_unique<pqxx::connection>(conn_string));
+        }
+    }
+
+    ConnectionPool(const ConnectionPool&) = delete;
+    ConnectionPool& operator=(const ConnectionPool&) = delete;
+
+    // RAII guard: ยืม connection ตอน construct คืนกลับ pool ตอน destruct เสมอ
+    // (แม้จะออกจากฟังก์ชันด้วย exception ก็ตาม — เหมือนหลักการเดียวกับ std::lock_guard)
+    class Guard {
+    public:
+        Guard(ConnectionPool& pool, std::unique_ptr<pqxx::connection> conn)
+            : pool_(pool), conn_(std::move(conn)) {}
+
+        ~Guard() {
+            if (conn_) pool_.release(std::move(conn_));
+        }
+
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+        Guard(Guard&&) = default;
+
+        pqxx::connection& operator*() { return *conn_; }
+
+    private:
+        ConnectionPool& pool_;
+        std::unique_ptr<pqxx::connection> conn_;
+    };
+
+    // ยืม connection ออกจาก pool — ถ้า pool ว่างพอดี (ทุก connection ถูกยืมหมด) thread
+    // ที่เรียกจะ "รอ" (block) จน thread อื่นคืน connection กลับมาก่อน ผ่าน condition_variable
+    // (ไม่ใช่ busy-wait) นี่คือกลไกที่จำกัดจำนวน concurrent database access สูงสุด = ขนาด pool
+    Guard acquire() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return !available_.empty(); });
+        std::unique_ptr<pqxx::connection> conn = std::move(available_.back());
+        available_.pop_back();
+        return Guard(*this, std::move(conn));
+    }
+
+private:
+    void release(std::unique_ptr<pqxx::connection> conn) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            available_.push_back(std::move(conn));
+        }
+        cv_.notify_one();
+    }
+
+    std::vector<std::unique_ptr<pqxx::connection>> available_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+};
+```
+
+จุดที่ต้องเข้าใจให้ลึก:
+
+1. **`std::unique_ptr<pqxx::connection>`**: เก็บเป็น pointer ไม่ใช่ value ตรงๆ เพราะ
+   `pqxx::connection` ไม่รองรับการย้าย (move) แบบง่ายในบางเวอร์ชัน และเราต้องการ "ย้าย
+   ความเป็นเจ้าของ" connection ไปมาระหว่าง pool กับ Guard โดยไม่ก็อปปี้
+2. **`cv_.wait(lock, predicate)`**: ถ้า pool ว่าง (`available_.empty()`) thread ที่เรียก
+   `acquire()` จะถูก "พักการทำงาน" (block แบบไม่กิน CPU) จนกว่าจะมี thread อื่นเรียก
+   `release()` แล้วปลุก (`notify_one()`) — นี่คือกลไกที่ทำให้ pool ทำหน้าที่เป็น **Semaphore
+   จำกัดจำนวน concurrent database access สูงสุดเท่ากับขนาด pool** ไปพร้อมกันในตัว
+3. **RAII (`Guard` destructor)**: ไม่ว่าฟังก์ชันที่ยืม connection จะจบแบบปกติ หรือจบเพราะ
+   exception หลุดออกมา (เช่น `InsufficientStockError` ใน `place_order()`) `Guard` จะคืน
+   connection กลับ pool เสมอ — ไม่มีทาง "connection รั่ว" (leak) ค้างอยู่นอก pool ได้เลย
+
+แก้ `Db` ให้ใช้ pool แทน connection ตัวเดียว (`db.hpp` ในหัวข้อ 121.5 คือเวอร์ชันที่แก้แล้ว):
+
+```cpp
+// db.hpp — ก่อนแก้: pqxx::connection conn_;
+// db.hpp — หลังแก้:
+private:
+    ConnectionPool pool_;
+```
+
+และทุกเมธอดของ `Db` เปลี่ยนจาก:
+
+```cpp
+pqxx::work txn(conn_);   // ❌ ก่อนแก้: ใช้ connection เดียวกันทุก thread
+```
+
+เป็น:
+
+```cpp
+auto conn = pool_.acquire();  // ✅ หลังแก้: ยืม connection ของตัวเองมาใช้
+pqxx::work txn(*conn);
+```
+
+(ครบทุกเมธอดตามที่แสดงเต็มรูปแบบใน 121.5–121.6)
+
+`main.cpp` ส่ง `pool_size` เข้าไปให้ `Db` และอ่านค่าจาก environment variable ได้ (สำหรับปรับ
+ขนาด pool ตอน deploy จริงโดยไม่ต้อง compile ใหม่):
+
+```cpp
+std::size_t pool_size = std::stoul(get_env_or("DB_POOL_SIZE", "8"));
+Db db(conn_string, pool_size);
+```
+
+ตั้งค่า default ไว้ที่ 8 (มากกว่าจำนวน worker thread ของ Crow บนเครื่องนี้ที่มี 4 thread) เพื่อ
+ไม่ให้ request ต้องรอคิวกันเปล่าๆ ทั้งที่ CPU core ยังว่างอยู่ — กฎทั่วไปคือตั้ง pool size ให้
+**มากกว่าหรือเท่ากับ** จำนวน worker thread เสมอ
+
+### ขั้นที่ 5: Build ใหม่และพิสูจน์ว่าแก้ได้จริง
+
+```bash
+$ cmake --build build -j4
+[ 37%] Building CXX object CMakeFiles/ecommerce_api.dir/src/routes_catalog.cpp.o
+[ 37%] Building CXX object CMakeFiles/ecommerce_api.dir/src/routes_auth.cpp.o
+[ 37%] Building CXX object CMakeFiles/ecommerce_api.dir/src/db.cpp.o
+[ 50%] Building CXX object CMakeFiles/ecommerce_api.dir/src/main.cpp.o
+[ 62%] Building CXX object CMakeFiles/ecommerce_api.dir/src/routes_orders.cpp.o
+[ 75%] Building CXX object CMakeFiles/ecommerce_api.dir/src/jwt.cpp.o
+[ 87%] Building CXX object CMakeFiles/ecommerce_api.dir/src/password.cpp.o
+[100%] Linking CXX executable ecommerce_api
+[100%] Built target ecommerce_api
+```
+
+Build ผ่านสะอาด ไม่มี warning เช่นเดิม รีเซ็ตฐานข้อมูล สร้างสินค้าทดสอบใหม่ (stock=10) แล้วรัน
+`concurrency_test.sh` **ตัวเดิมทุกบรรทัด** อีกครั้ง:
+
+```bash
+$ ./concurrency_test.sh
+ยิง 30 คำขอ POST /orders พร้อมกัน (แข่งกันซื้อสินค้า id=5 ที่มี stock เริ่มต้น = 10)...
+--- สรุปผลลัพธ์ HTTP status code จากทั้ง 30 คำขอ ---
+     10 201
+     20 409
+สำเร็จ (201): 10 ครั้ง
+ถูกปฏิเสธเพราะสต็อกไม่พอ (409): 20 ครั้ง
+```
+
+**ไม่มี `500` แม้แต่ตัวเดียวอีกต่อไป** — จำนวน `201` (สำเร็จ) เท่ากับจำนวนสต็อกเป๊ะ (10) และ
+`409` (ถูกปฏิเสธ) ครบ 20 ที่เหลือพอดี (30 - 10 = 20) ตรวจสอบสถานะฐานข้อมูลจริงยืนยันอีกชั้น:
+
+```bash
+$ curl -s http://127.0.0.1:18480/products/5
+{"data":{"category_id":1,"category_name":"อุปกรณ์อิเล็กทรอนิกส์","description":"ผลิตจำนวนจำกัดสำหรับทดสอบ concurrency","id":5,"name":"หูฟังรุ่นลิมิเต็ด Edition","price_cents":199000,"sku":"LTD-001","stock":0},"success":true}
+
+$ PGPASSWORD=ecom_pass123 psql -h 127.0.0.1 -U ecomuser -d ecommercedb \
+  -c "SELECT count(*) orders_count, sum(quantity) units_sold FROM order_items WHERE product_id=5;"
+ orders_count | units_sold
+--------------+------------
+           10 |         10
+(1 row)
+```
+
+**`stock = 0` พอดี ไม่ติดลบแม้แต่หน่วยเดียว** และมี order_item ที่สั่งสินค้าตัวนี้จริง **10
+รายการ 10 ชิ้นพอดี** ตรงกับจำนวน `201` ที่นับได้ทุกประการ — ไม่มีการ Oversell เกิดขึ้นเลย
+
+### ทดสอบซ้ำด้วยขนาดที่ใหญ่ขึ้น (N=50) เพื่อความมั่นใจ
+
+เพื่อให้แน่ใจว่าผลลัพธ์ก่อนหน้าไม่ใช่ความบังเอิญ สร้างสินค้าใหม่ที่มี `stock = 20` แล้วยิง
+**50 concurrent request** พร้อมกัน:
+
+```bash
+$ ./concurrency_test_50.sh
+ยิง 50 คำขอ POST /orders พร้อมกัน (แข่งกันซื้อสินค้า id=8 ที่มี stock เริ่มต้น = 20)...
+--- สรุปผลลัพธ์ HTTP status code จากทั้ง 50 คำขอ ---
+     20 201
+     30 409
+```
+
+```bash
+$ curl -s http://127.0.0.1:18480/products/8
+{"data":{...,"id":8,"name":"นาฬิกาสมาร์ทวอทช์รุ่นพิเศษ","sku":"LTD-002","stock":0},"success":true}
+
+$ PGPASSWORD=ecom_pass123 psql -h 127.0.0.1 -U ecomuser -d ecommercedb \
+  -c "SELECT count(*), sum(quantity) FROM order_items WHERE product_id=8;"
+ count | sum
+-------+-----
+    20 |  20
+(1 row)
+```
+
+ผลลัพธ์เหมือนเดิมทุกประการ (ไม่มี `500`, `201` เท่ากับ stock เป๊ะ, สต็อกสุดท้ายเป็น `0` ไม่ติดลบ)
+— พิสูจน์ว่าการแก้ปัญหาถูกต้องและสามารถทำซ้ำได้ (reproducible) ไม่ใช่ผลบังเอิญจากการรันครั้งเดียว
+
+### ทดสอบการป้องกัน Deadlock ด้วย Multi-Item Orders
+
+สุดท้าย พิสูจน์ว่าการเรียง `product_id` ก่อนล็อก (หัวข้อ 121.6) ป้องกัน deadlock ได้จริง โดย
+สร้างสินค้า 2 ตัวใหม่ (id=6, id=7 สต็อกตัวละ 500) แล้วยิง 40 order พร้อมกัน สลับลำดับ item ใน
+body ไปมา (บางอันส่ง `[6,7]` บางอันส่ง `[7,6]`):
+
+```bash
+#!/bin/bash
+# deadlock_test.sh
+order_forward() {
+    curl -s -o /dev/null -w "%{http_code} %{time_total}\n" -X POST "$BASE/orders" \
+        -H "Authorization: Bearer $CUST_TOKEN" -H "Content-Type: application/json" \
+        -d '{"items":[{"product_id":6,"quantity":1},{"product_id":7,"quantity":1}]}'
+}
+order_reverse() {
+    curl -s -o /dev/null -w "%{http_code} %{time_total}\n" -X POST "$BASE/orders" \
+        -H "Authorization: Bearer $CUST_TOKEN" -H "Content-Type: application/json" \
+        -d '{"items":[{"product_id":7,"quantity":1},{"product_id":6,"quantity":1}]}'
+}
+# ยิงสลับ forward/reverse 40 ครั้งพร้อมกันทั้งหมด แล้ว wait
+```
+
+ผลลัพธ์จริง (ตัดมาบางส่วน):
+
+```
+$ ./deadlock_test.sh
+ยิง 40 คำขอพร้อมกัน สลับลำดับ product_id ใน body ไปมา (ทดสอบ deadlock avoidance)...
+201 0.007550
+201 0.006961
+201 0.007776
+...
+201 0.013021
+
+real	0m0.152s
+user	0m0.220s
+sys	0m0.114s
+--- สรุป HTTP status ---
+     40 201
+```
+
+ทั้ง 40 request สำเร็จหมด (`201` ทุกตัว) ภายในเวลารวมแค่ **0.152 วินาที** โดยแต่ละ request ใช้
+เวลาไม่เกิน 41 มิลลิวินาที — ไม่มี request ไหน "ค้าง" รอกันเป็นเวลานานผิดปกติ (ซึ่งจะเป็น
+สัญญาณของ deadlock ที่รอจน PostgreSQL ตรวจจับและยกเลิกเอง ปกติใช้เวลาหลายวินาทีถึงจะ timeout)
+ยืนยัน stock สุดท้ายถูกต้อง:
+
+```bash
+$ curl -s http://127.0.0.1:18480/products/6; echo
+{"data":{...,"stock":460},"success":true}
+$ curl -s http://127.0.0.1:18480/products/7; echo
+{"data":{...,"stock":460},"success":true}
+```
+
+เริ่มต้นสต็อก 500 แต่ละตัว ถูกสั่งซื้อไป 40 ชิ้น (500 - 40 = 460) ตรงกันทั้งสองสินค้า — การล็อก
+ตามลำดับ `product_id` ทำงานถูกต้อง ไม่มี deadlock เกิดขึ้นแม้แต่ครั้งเดียวตลอด 40 request ที่
+จงใจส่งลำดับสลับกันไปมา
+
+### สรุปตารางเปรียบเทียบ ก่อน/หลังแก้บั๊ก
+
+| รายการ | ก่อนแก้ (connection เดียว) | หลังแก้ (Connection Pool) |
+|---|---|---|
+| จำนวน `500 Internal Server Error` จาก 30 concurrent request | 16 | **0** |
+| จำนวน `201 Created` (ตรงกับ stock=10 หรือไม่) | 10 (ตรง แต่ปนกับ error) | **10 (ตรงเป๊ะ)** |
+| สถานะ connection หลังทดสอบ | พัง ("Lost connection") ต้อง restart server | ปกติ ใช้งานต่อได้ทันที |
+| ผลลัพธ์ทดสอบซ้ำ (reproducibility) | ไม่แน่นอน (race condition ขึ้นกับ timing) | สม่ำเสมอทุกครั้งที่รันซ้ำ (ทดสอบแล้วที่ N=30 และ N=50) |
+
+---
