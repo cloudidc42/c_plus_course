@@ -638,6 +638,62 @@ sizeof(std::vector<int>)  = 24
 
 ---
 
+## ส่วนเสริม: กรณีพิเศษของ std::vector\<bool\>
+
+ก่อนจะไปหัวข้อข้อผิดพลาดที่พบบ่อย มีข้อยกเว้นหนึ่งที่ควรรู้ไว้เพราะเป็นคำถามสัมภาษณ์งาน
+ยอดฮิต: **`std::vector<bool>` ไม่ได้ทำงานเหมือน `vector<T>` ชนิดอื่นเลย**
+
+```cpp
+#include <iostream>
+#include <type_traits>
+#include <vector>
+
+int main() {
+    std::vector<bool> flags = {true, false, true};
+
+    // v[0] ไม่ได้คืนค่า bool& จริงๆ แต่คืน std::vector<bool>::reference (proxy object)
+    // เพราะ vector<bool> เก็บข้อมูลแบบ "บิตอัด" (1 บิตต่อ 1 ค่า) ไม่ใช่ 1 ไบต์ต่อค่าเหมือน bool ปกติ
+    auto elem = flags[0];
+    std::cout << "std::is_same<decltype(elem), bool>::value = "
+              << std::boolalpha << std::is_same<decltype(elem), bool>::value << '\n';
+
+    flags[1] = true;
+    for (bool b : flags) {
+        std::cout << b << ' ';
+    }
+    std::cout << '\n';
+
+    std::cout << "sizeof(bool) = " << sizeof(bool) << " bytes ต่อค่า (ปกติ)\n";
+    std::cout << "แต่ std::vector<bool> ใช้พื้นที่จริงประมาณ 1 บิตต่อค่า (bit-packed)\n";
+
+    return 0;
+}
+```
+
+ผลลัพธ์:
+
+```
+std::is_same<decltype(elem), bool>::value = false
+true true true 
+sizeof(bool) = 1 bytes ต่อค่า (ปกติ)
+แต่ std::vector<bool> ใช้พื้นที่จริงประมาณ 1 บิตต่อค่า (bit-packed)
+```
+
+**เหตุผล**: `std::vector<bool>` เป็น **template specialization พิเศษ** ของ `vector` ที่ถูก
+ออกแบบมาให้ประหยัดหน่วยความจำ โดยเก็บค่าจริงแบบ **บีบอัดทีละบิต** (1 บิตต่อ 1 ค่า `bool`)
+แทนที่จะเก็บทีละไบต์แบบปกติ ผลข้างเคียงคือ `operator[]` ของมัน**ไม่สามารถคืนค่าเป็น
+`bool&` จริงๆ ได้** (เพราะไม่มี "ที่อยู่ของบิตเดี่ยว" ในภาษา C++) จึงต้องคืนเป็น **proxy
+object** (`std::vector<bool>::reference`) แทน ซึ่งทำให้โค้ดบางแบบที่ใช้ได้กับ
+`vector<T>` ชนิดอื่น (เช่น การส่ง `bool&` ออกจากฟังก์ชัน หรือใช้กับ generic code ที่
+คาดหวัง `T&`) ใช้ไม่ได้กับ `vector<bool>`
+
+ด้วยเหตุนี้ C++ Core Guidelines และวิศวกรมืออาชีพจำนวนมากจึงแนะนำให้**หลีกเลี่ยง
+`std::vector<bool>`** ในโค้ด generic หรือโค้ดที่ต้องการ reference จริง — ถ้าต้องการ array
+ของค่า boolean จำนวนมากที่ต้องประหยัดหน่วยความจำจริงๆ ให้พิจารณา `std::bitset` (ถ้าขนาด
+คงที่รู้ตอน compile-time) หรือ `std::deque<bool>` / `std::vector<char>` แทน
+
+---
+
 ## ข้อผิดพลาดที่พบบ่อย (Common Pitfalls)
 
 1. **ใช้ `operator[]` เข้าถึง index ที่เกินขอบเขต** — ไม่มี error หรือ warning ใดๆ ตอน compile
