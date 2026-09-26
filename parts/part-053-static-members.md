@@ -53,6 +53,71 @@ Object ปกติ (instance member)          static member (แชร์ร่
       └─────────────────┴──────── ทั้งสอง object เข้าถึง static member ตัวเดียวกัน
 ```
 
+### static มีความหมายมากกว่าหนึ่งอย่างใน C/C++ — อย่าสับสน
+
+ก่อนไปต่อ ต้องแยกให้ออกว่า keyword `static` ในภาษา C/C++ มีความหมาย**ต่างกันถึง 3 แบบ**
+ขึ้นอยู่กับบริบทที่ใช้ ทั้งที่เขียนคำเดียวกันเป๊ะ — ความสับสนตรงนี้เป็นเรื่องปกติมากสำหรับ
+ผู้เรียนใหม่:
+
+| บริบทที่ใช้ `static` | ความหมาย | เรียนที่ Part ไหน |
+|---|---|---|
+| หน้าฟังก์ชัน/ตัวแปร **ระดับไฟล์** (`static int x;` นอกฟังก์ชันใดๆ) | **Internal Linkage** — จำกัดให้มองเห็นได้เฉพาะใน translation unit (ไฟล์ `.cpp` นั้น) เท่านั้น | Part 17 (Modular Programming) |
+| หน้าตัวแปร **ภายในฟังก์ชัน** (`static int x;` ในฟังก์ชัน) | **Static Local Variable** — สร้างครั้งเดียว คงค่าข้ามการเรียกแต่ละครั้ง | ใช้ครั้งแรกใน Part 6, และใช้สร้าง Singleton ใน Part นี้ (53.5) |
+| หน้าสมาชิกของ **class** (`static int x;` ใน class) | **Static Data/Function Member** — แชร์ร่วมกันของทุก object ใน class นั้น | **หัวข้อหลักของ Part นี้** |
+
+```cpp
+#include <iostream>
+
+// (1) static ที่ file scope: internal linkage -- มองเห็นได้เฉพาะใน translation unit นี้เท่านั้น
+//     (ทบทวน Part 17: Modular Programming) ไม่เกี่ยวข้องกับ static member ของ class เลย
+static int fileScopeCounter = 0;
+
+// (2) static local variable ภายในฟังก์ชัน: คงค่าข้ามการเรียกแต่ละครั้ง สร้างครั้งเดียว
+int callCount() {
+    static int count = 0;   // initialize ครั้งเดียวตอนเรียกครั้งแรกเท่านั้น
+    return ++count;
+}
+
+// (3) static data member ของ class: แชร์ร่วมกันของทุก object (หัวข้อหลักของ Part นี้)
+class Widget {
+public:
+    Widget() { ++instanceCount_; }
+    static int instanceCount() { return instanceCount_; }
+private:
+    static int instanceCount_;
+};
+int Widget::instanceCount_ = 0;
+
+int main() {
+    ++fileScopeCounter;
+    ++fileScopeCounter;
+    std::cout << "fileScopeCounter: " << fileScopeCounter << '\n';
+
+    std::cout << "callCount(): " << callCount() << '\n';
+    std::cout << "callCount(): " << callCount() << '\n';
+    std::cout << "callCount(): " << callCount() << '\n';
+
+    Widget w1, w2, w3;
+    std::cout << "Widget::instanceCount(): " << Widget::instanceCount() << '\n';
+}
+```
+
+ผลลัพธ์:
+
+```
+fileScopeCounter: 2
+callCount(): 1
+callCount(): 2
+callCount(): 3
+Widget::instanceCount(): 3
+```
+
+จุดร่วมของทั้งสามความหมาย: `static` ทุกแบบล้วนเกี่ยวข้องกับ **"อายุของ storage" (storage
+duration)** ที่ยาวนานกว่าปกติ — ตัวแปรที่เป็น `static` (ไม่ว่าจะแบบไหน) จะถูกจัดสรรพื้นที่ใน
+หน่วยความจำเพียงครั้งเดียวตอนโปรแกรมเริ่มทำงาน (หรือครั้งแรกที่ถูกใช้ กรณี static local
+variable) และมีอยู่ตลอดจนโปรแกรมจบการทำงาน ต่างจากตัวแปรธรรมดาใน stack ที่หายไปเมื่อออกจาก
+scope แต่ **บริบทการมองเห็น (visibility/scope)** ของแต่ละแบบต่างกันอย่างสิ้นเชิงตามตารางข้างต้น
+
 ### กฎสำคัญ: ต้อง define static data member นอก class เสมอ
 
 การประกาศ static member ใน class (`static double interestRate_;`) เป็นเพียง **การประกาศ
@@ -661,6 +726,63 @@ int main() {
 จุดสำคัญ: เมื่อ `e3` หลุดออกจาก scope ย่อย destructor ถูกเรียกอัตโนมัติ ทำให้ `employeeCount_`
 ลดกลับเหลือ 2 ตรงกับ `e1` และ `e2` ที่ยังอยู่ใน `main` — เป็นรูปแบบเดียวกับ Object Counter ใน
 53.3 ทุกประการ เพียงแค่เปลี่ยนบริบทเป็นระบบพนักงาน
+
+### แนวทางเฉลยข้อ 3
+
+```cpp
+#include <iostream>
+#include <map>
+#include <string>
+
+class ConfigManager {
+public:
+    ConfigManager(const ConfigManager&) = delete;
+    ConfigManager& operator=(const ConfigManager&) = delete;
+
+    static ConfigManager& getInstance() {
+        static ConfigManager instance;
+        return instance;
+    }
+
+    void set(const std::string& key, const std::string& value) {
+        settings_[key] = value;
+    }
+
+    std::string get(const std::string& key) const {
+        auto it = settings_.find(key);
+        return (it != settings_.end()) ? it->second : std::string("");
+    }
+
+private:
+    ConfigManager() = default;
+    std::map<std::string, std::string> settings_;
+};
+
+int main() {
+    ConfigManager::getInstance().set("app_name", "Library System");
+    ConfigManager::getInstance().set("max_borrow", "3");
+
+    std::cout << "app_name = " << ConfigManager::getInstance().get("app_name") << '\n';
+    std::cout << "max_borrow = " << ConfigManager::getInstance().get("max_borrow") << '\n';
+    std::cout << "unknown = \"" << ConfigManager::getInstance().get("unknown") << "\"\n";
+}
+```
+
+ผลลัพธ์:
+
+```
+app_name = Library System
+max_borrow = 3
+unknown = ""
+```
+
+จุดสำคัญ: โครงสร้างนี้เหมือนกับ `Logger` ใน 53.5 ทุกประการ (private constructor, ลบ copy
+constructor/assignment, static local variable ใน `getInstance()`) เพียงแค่เปลี่ยนข้อมูลภายใน
+จาก `vector<string>` เป็น `map<string, string>` — แสดงให้เห็นว่า **รูปแบบ (pattern) ของ
+Singleton เป็นสิ่งที่นำไปใช้ซ้ำได้กับข้อมูลชนิดใดก็ได้** ไม่ว่าจะเป็น log, การตั้งค่า, หรือ
+connection pool ก็ใช้โครงสร้างเดียวกันนี้ได้ทั้งหมด `get()` คืน string ว่างเมื่อไม่พบ key
+(แทนที่จะ throw exception) ซึ่งเป็นทางเลือกในการออกแบบที่สมเหตุสมผลสำหรับ configuration ทั่วไป
+ที่ไม่ควรทำให้โปรแกรมล้มเพียงเพราะ key ไม่มีอยู่
 
 ### แนวทางเฉลยข้อ 5
 
