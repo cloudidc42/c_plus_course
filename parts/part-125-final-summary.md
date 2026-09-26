@@ -595,3 +595,7 @@ Part 93 มีความหมาย มันคือคุณสมบั�
    แค่ไหน — นั่นคือหลักฐานที่ชัดเจนที่สุดว่าการเติบโตยังคงดำเนินต่อไป
 
 **จบหลักสูตร C/C++ ฉบับสมบูรณ์ — Step 1000 จาก 1000**
+
+*Part 125 จาก 125 | Module K — Capstone Projects และบทสรุป | หลักสูตร C/C++ ฉบับสมบูรณ์: จากศูนย์สู่ระดับโลก*
+
+*"The only way to learn a new programming language is by writing programs in it." — Dennis Ritchie & Brian Kernighan, The C Programming Language*
