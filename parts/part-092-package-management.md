@@ -47,6 +47,39 @@ libxxx-dev` เช่น `libbenchmark-dev` ใน Part 90 หรือ `libgtes
    แล้ว configure/build/install ด้วยมือทุกขั้นตอน — งานที่ทำซ้ำแบบนี้ใน C++ ใช้เวลามากกว่า
    ภาษาอื่นอย่างเทียบกันไม่ได้
 
+### ลองจินตนาการโลกที่ไม่มี Package Manager เลย
+
+ก่อนจะมี vcpkg/Conan (และก่อนที่ distro จะมี `apt`/`brew` สมบูรณ์แบบอย่างทุกวันนี้) นักพัฒนา
+C++ ต้อง build 3rd-party library ทุกตัวด้วยมือตามขั้นตอนคลาสสิกนี้ (อ้างอิงความรู้เรื่อง
+Static/Dynamic Library จาก **Part 39**):
+
+```bash
+# 1. ดาวน์โหลด source code ของ library เอง (มักเป็น .tar.gz)
+wget https://example.com/somelib-1.2.3.tar.gz
+tar xzf somelib-1.2.3.tar.gz
+cd somelib-1.2.3
+
+# 2. อ่าน README เพื่อรู้ว่า build dependency ของ library นี้คืออะไรบ้าง
+#    (บางที library ตัวนี้ก็ต้องพึ่ง library อื่นอีกทีเป็นทอดๆ)
+./configure --prefix=/usr/local
+
+# 3. Build จาก source เอง (ใช้เวลานานแค่ไหนขึ้นกับขนาด library)
+make -j$(nproc)
+
+# 4. ติดตั้งเข้าระบบด้วยสิทธิ์ root (มักเขียนทับ path ของระบบตรงๆ)
+sudo make install
+
+# 5. กลับไปที่โปรเจกต์ของเรา แล้วหวังว่า compiler จะหา header/library เจอ
+g++ -I/usr/local/include -L/usr/local/lib myapp.cpp -lsomelib -o myapp
+```
+
+ถ้า library ที่ต้องการมี dependency ของตัวเองอีก 5-10 ตัว (เรื่องปกติมากสำหรับ library ขนาด
+ใหญ่อย่าง OpenCV หรือ Boost) ก็ต้องทำ 5 ขั้นตอนนี้ซ้ำสำหรับทุก dependency ในลำดับที่ถูกต้อง
+ด้วยมือ — และถ้าเพื่อนร่วมทีมอีกคนใช้ macOS ขั้นตอนเหล่านี้ก็อาจต้องปรับแก้ใหม่ทั้งหมด เพราะ
+`./configure` บางตัวอาจไม่รองรับ macOS หรือ path ของระบบต่างกัน นี่คือปัญหาที่แท้จริงที่
+vcpkg/Conan เกิดขึ้นมาแก้ไข: ให้กระบวนการทั้ง 5 ขั้นตอนนี้ (และการไล่ dependency graph ที่
+ซับซ้อนกว่านี้มาก) ถูกทำให้อัตโนมัติ ทำซ้ำได้ และพอร์ตข้ามแพลตฟอร์มได้ในคำสั่งเดียว
+
 เปรียบเทียบกับภาษาอื่นที่มี Package Manager มาตรฐานติดตัวมาตั้งแต่ต้น:
 
 ```bash
@@ -779,6 +812,70 @@ class ModuleHDemoRecipe(ConanFile):
 library ต่างกันตามเงื่อนไข (เช่น เฉพาะบน Windows ถึงจะต้องการ library ตัวหนึ่ง) สามารถเขียน
 logic ภาษา Python ปกติภายในเมธอด `requirements()` ได้เลย ซึ่งเป็นข้อได้เปรียบสำคัญของ Conan
 เหนือ vcpkg ในกรณีที่ dependency ของโปรเจกต์ซับซ้อนขึ้นตามแพลตฟอร์มหรือ configuration
+
+### แนวทางเฉลยข้อ 4
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(MixedDepsApp LANGUAGES CXX)
+
+# pthread มากับ OS อยู่แล้ว (Part 31) -- ใช้ Find Module มาตรฐานของ CMake ตรงๆ
+find_package(Threads REQUIRED)
+
+# fmt สมมติว่ามาจาก vcpkg/Conan ผ่าน toolchain file ตอน configure
+# (cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=.../vcpkg.cmake)
+find_package(fmt REQUIRED)
+
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE Threads::Threads fmt::fmt)
+```
+
+`main.cpp` ตัวอย่างที่ใช้ทั้งสอง dependency ร่วมกัน:
+
+```cpp
+#include <fmt/core.h>
+#include <thread>
+#include <cstdio>
+
+int main() {
+    std::thread t([] {
+        fmt::print("Hello from a std::thread using fmt!\n");
+    });
+    t.join();
+    return 0;
+}
+```
+
+ประเด็นสำคัญของเฉลยนี้คือการยืนยันแนวคิดจากหัวข้อ 92.6 ด้วยโค้ดจริง: `find_package` ทั้ง
+สองบรรทัดมีรูปแบบเดียวกันทุกประการ แม้ `Threads` จะมาจาก CMake's built-in Find Module ที่
+ค้นหาใน system โดยตรง ส่วน `fmt` มาจาก config file ที่ Package Manager ภายนอกสร้างให้ —
+ผู้เขียนโค้ดในไฟล์นี้ไม่จำเป็นต้องรู้หรือสนใจความต่างนั้นเลย
+
+### แนวทางเฉลยข้อ 5
+
+องค์กรในสาย Defense/Finance มักถูกกำหนดด้วยนโยบายด้าน Security ที่เข้มงวดว่าเครื่องที่ใช้
+พัฒนา/build ซอฟต์แวร์ (โดยเฉพาะ Build Server ใน CI/CD) **ห้ามเชื่อมต่อ internet สาธารณะ
+โดยตรง** (เรียกว่า Air-gapped Network) เหตุผลหลักมีอย่างน้อย 3 ข้อ:
+
+1. **ป้องกัน Supply Chain Attack**: ถ้า Build Server ดึง dependency จาก ConanCenter/vcpkg
+   ports สาธารณะโดยตรงทุกครั้งที่ build และมีใครแฮ็ก package บนนั้นสำเร็จ (เคยเกิดเหตุการณ์
+   จริงลักษณะนี้กับ Package Registry ของหลายภาษามาแล้ว) โค้ดอันตรายจะถูกดึงเข้ามาปนใน
+   Production Build โดยตรงทันที การตัดขาด internet และควบคุมทุก dependency ผ่าน registry
+   ภายในที่ผ่านการตรวจสอบ (Audit) ก่อนเท่านั้น ลดความเสี่ยงนี้ได้มาก
+2. **ควบคุมและตรวจสอบทุก dependency ได้ (Compliance)**: อุตสาหกรรม Finance/Defense
+   มักต้องผ่านการตรวจสอบตามมาตรฐาน (เช่น ต้องพิสูจน์ได้ว่าโค้ดทุกบรรทัดที่ใช้ในระบบผ่านการ
+   Audit ด้าน Security แล้ว) การมี Private Registry ที่เก็บเฉพาะเวอร์ชันของ library ที่ผ่านการ
+   ตรวจสอบและอนุมัติแล้วเท่านั้น ทำให้ตอบคำถามผู้ตรวจสอบ (Auditor) ได้ง่ายกว่าการอนุญาตให้
+   ทุกเครื่องดึงอะไรก็ได้จาก internet สาธารณะโดยตรง
+3. **ความเสถียรและ Availability**: ถ้า Build Server ทุกเครื่องพึ่งพา ConanCenter/vcpkg ports
+   สาธารณะโดยตรง แล้ว service เหล่านั้น down หรือช้าชั่วคราว (เกิดขึ้นได้เสมอกับ service
+   สาธารณะที่มีคนใช้งานทั่วโลก) การ build ทั้งองค์กรจะหยุดชะงักไปด้วย การมี Binary Cache/
+   Private Registry ภายในองค์กรทำให้ build เร็วและเสถียรกว่ามาก เพราะดึงจากเครือข่ายภายใน
+   ที่ควบคุมคุณภาพเองได้
+
+ปัญหาที่เราเจอจริงในบทเรียนนี้ (`403 Forbidden` จาก proxy ตอนพยายามเข้าถึง ConanCenter
+และ GitHub) เป็นตัวอย่างเล็กๆ ของสถานการณ์แบบเดียวกันนี้พอดี — sandbox ที่ใช้รันบทเรียนถูก
+จำกัด network ด้วยเหตุผลด้าน Security เช่นเดียวกับที่องค์กรใหญ่ๆ ทำกับ Build Server ของตัวเอง
 
 ---
 
