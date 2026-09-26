@@ -344,6 +344,45 @@ container โดยไม่ต้องมีเงื่อนไขพิเ�
 ชนิด container และ 3) เปิดโอกาสให้ compiler/library ปรับแต่งประสิทธิภาพภายในได้
 โดยไม่กระทบโค้ดฝั่งผู้ใช้เลย
 
+`std::find` เป็น **Linear Search** เสมอ (O(n)) เหมือนกับที่เรียนใน Part 24
+ไม่ว่าข้อมูลจะเรียงลำดับไว้แล้วหรือไม่ก็ตาม แต่ถ้าข้อมูลใน range **เรียงลำดับ
+ไว้แล้ว** (sorted) `<algorithm>` มีฟังก์ชันที่เร็วกว่ามากให้ใช้แทน นั่นคือ
+`std::binary_search` และ `std::lower_bound` ที่ทำงานแบบ **Binary Search**
+(O(log n)) ตามหลักการที่เรียนใน Part 24 เช่นกัน:
+
+```cpp
+#include <cstdio>
+#include <vector>
+#include <algorithm>
+
+int main(void) {
+    std::vector<int> v = {1, 3, 5, 7, 9, 11};
+
+    bool found = std::binary_search(v.begin(), v.end(), 7);
+    std::printf("พบ 7 หรือไม่: %s\n", found ? "พบ" : "ไม่พบ");
+
+    auto it = std::lower_bound(v.begin(), v.end(), 6);
+    std::printf("ตำแหน่งแรกที่ >= 6 คือค่า %d\n", *it);
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 binary_search_demo.cpp -o binary_search_demo
+./binary_search_demo
+# พบ 7 หรือไม่: พบ
+# ตำแหน่งแรกที่ >= 6 คือค่า 7
+```
+
+`std::binary_search` คืนแค่ `bool` (พบหรือไม่พบ) ส่วน `std::lower_bound` คืน
+iterator ที่ชี้ไปยัง **ตำแหน่งแรกที่มีค่าไม่น้อยกว่า** ค่าที่ค้นหา (มีประโยชน์
+มากเวลาต้องการรู้ "ตำแหน่งที่ควรแทรก" ข้อมูลใหม่เพื่อให้ยังคงเรียงลำดับอยู่)
+**ข้อแม้สำคัญที่ต้องจำ**: ทั้งสองฟังก์ชันนี้ใช้ได้เฉพาะกับ range ที่**เรียง
+ลำดับไว้แล้วเท่านั้น** ถ้าเรียกกับข้อมูลที่ไม่ได้เรียงลำดับ ผลลัพธ์จะไม่
+ถูกต้องโดยไม่มี error หรือ warning ใดๆ เตือนเลย (เป็น Undefined Behavior ตาม
+ข้อกำหนดของมาตรฐาน)
+
 ---
 
 ## 63.4 std::transform (Step 500)
@@ -458,6 +497,45 @@ g++ -Wall -Wextra -Wpedantic -std=c++17 accumulate_demo.cpp -o accumulate_demo
 iterator — ใช้บ่อยเวลาต้องการสถิติสรุปข้อมูล เช่น "มีสินค้ากี่ชิ้นที่หมดสต็อก"
 หรือ "มีนักเรียนกี่คนที่สอบผ่าน"
 
+`std::accumulate` ไม่จำเป็นต้องใช้กับตัวเลขเท่านั้น — ตราบใดที่ชนิดข้อมูลของ
+ค่าเริ่มต้นรองรับ operation ที่กำหนด (default คือ `operator+`) ก็ใช้ได้หมด
+เช่น การต่อ (concatenate) `std::string` หลายตัวเข้าด้วยกัน:
+
+```cpp
+#include <cstdio>
+#include <vector>
+#include <string>
+#include <numeric>
+#include <iterator>
+
+int main(void) {
+    std::vector<std::string> words = {"C++", "is", "powerful"};
+
+    std::string sentence = std::accumulate(
+        std::next(words.begin()), words.end(), words.front(),
+        [](std::string acc, const std::string& w) {
+            return acc + " " + w;
+        });
+
+    std::printf("%s\n", sentence.c_str());
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 accumulate_string.cpp -o accumulate_string
+./accumulate_string
+# C++ is powerful
+```
+
+ตัวอย่างนี้เริ่มค่าเริ่มต้นด้วย `words.front()` (คำแรก) แล้ววนไล่ต่อคำที่เหลือ
+ตั้งแต่ `std::next(words.begin())` (ตัวที่สอง) เป็นต้นไป โดยใช้ lambda เป็น
+ตัวกำหนด operation การรวมค่า (แทนที่จะบวกตัวเลขแบบเดิม กลายเป็นการต่อ string
+พร้อมช่องว่างคั่น) — แสดงให้เห็นว่า `std::accumulate` เป็น algorithm แบบ
+**fold** ที่ทั่วไปกว่าแค่ "หาผลรวม" มาก สามารถ "พับรวม" ข้อมูลชนิดใดก็ได้ตาม
+กฎที่เรากำหนดเอง
+
 ---
 
 ## 63.6 std::for_each และ std::copy (Step 502)
@@ -512,6 +590,37 @@ g++ -Wall -Wextra -Wpedantic -std=c++17 foreach_copy.cpp -o foreach_copy
 "ชี้ไปยังหน่วยความจำที่มีอยู่จริง" เสมอไป แต่สามารถเป็น "ตัวห่อหุ้มพฤติกรรม"
 (behavior wrapper) ได้ด้วย ซึ่งเป็นการนำแนวคิด Iterator ที่เรียนใน Part 62
 ไปใช้ได้อย่างสร้างสรรค์
+
+หากต้องการคัดลอกเฉพาะสมาชิกที่ตรงเงื่อนไข (ไม่ใช่คัดลอกทั้งหมดแบบ `std::copy`)
+มี `std::copy_if` ให้ใช้ ซึ่งรวมความสามารถของ `std::copy` เข้ากับเงื่อนไขแบบ
+`std::find_if` ไว้ในตัวเดียว:
+
+```cpp
+#include <cstdio>
+#include <vector>
+#include <algorithm>
+#include <iterator>
+
+int main(void) {
+    std::vector<int> v = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<int> evens;
+
+    std::copy_if(v.begin(), v.end(), std::back_inserter(evens), [](int x) {
+        return x % 2 == 0;
+    });
+
+    for (int x : evens) std::printf("%d ", x);
+    std::printf("\n");
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 copy_if_demo.cpp -o copy_if_demo
+./copy_if_demo
+# 2 4 6 8
+```
 
 ---
 
@@ -599,6 +708,44 @@ container.erase(std::remove_if(container.begin(), container.end(), predicate),
 idiom นี้ เพราะโครงสร้าง linked list ลบ node กลางได้ใน O(1) โดยไม่ต้องย้าย
 ข้อมูลเหมือน array)
 
+Erase-Remove Idiom ใช้ได้กับ `std::string` เช่นกัน เพราะภายในมันคือ contiguous
+character array ที่มี `erase()` และรองรับ iterator แบบเดียวกับ `std::vector`
+ทุกประการ — ตัวอย่างที่ใช้บ่อยมากในโค้ดจริงคือการลบช่องว่างทั้งหมดออกจาก
+ข้อความ:
+
+```cpp
+#include <cstdio>
+#include <string>
+#include <algorithm>
+#include <cctype>
+
+int main(void) {
+    std::string s = "Hello,   World!  How are   you?";
+
+    s.erase(std::remove_if(s.begin(), s.end(), [](unsigned char c) {
+                return std::isspace(c);
+            }),
+            s.end());
+
+    std::printf("%s\n", s.c_str());
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 remove_whitespace.cpp -o remove_whitespace
+./remove_whitespace
+# Hello,World!Howareyou?
+```
+
+สังเกตว่า `std::isspace` รับพารามิเตอร์เป็น `unsigned char` (ไม่ใช่ `char`
+ตรงๆ) — นี่เป็น convention ที่ถูกต้องตามมาตรฐานเสมอเมื่อเรียกฟังก์ชันตระกูล
+`<cctype>` เพราะถ้า `char` เป็น signed บนระบบนั้น (ขึ้นกับ compiler/platform)
+และค่าตัวอักษรเป็นค่าติดลบ (เช่นตัวอักษรที่ไม่ใช่ ASCII มาตรฐาน) การส่งเข้า
+ฟังก์ชันเหล่านี้ตรงๆ จะเป็น Undefined Behavior — การ cast เป็น
+`unsigned char` ก่อนเสมอคือวิธีที่ปลอดภัยที่สุด
+
 ---
 
 ## 63.8 std::unique และการผสาน Algorithm กับ Lambda (Step 504)
@@ -652,6 +799,39 @@ g++ -Wall -Wextra -Wpedantic -std=c++17 unique_demo.cpp -o unique_demo
 "set ของค่าที่ไม่ซ้ำกันและเรียงลำดับแล้ว" จาก `std::vector` (ถ้าต้องการ set จริง
 ๆ ตั้งแต่แรกโดยไม่ต้องทำหลายขั้นตอนแบบนี้ ให้พิจารณาใช้ `std::set` ตาม Part 61
 แทน ขึ้นอยู่กับว่า pattern การใช้งานเหมาะกับอะไรมากกว่า)
+
+ถ้าต้องการ **เก็บผลลัพธ์ที่ไม่ซ้ำไว้ใน container ใหม่** โดยไม่แก้ไข container
+ต้นฉบับเลย มี `std::unique_copy` ให้ใช้ ซึ่งรวมพฤติกรรมของ `std::unique` กับ
+`std::copy` ไว้ในฟังก์ชันเดียว:
+
+```cpp
+#include <cstdio>
+#include <vector>
+#include <algorithm>
+#include <iterator>
+
+int main(void) {
+    std::vector<int> v = {1, 1, 2, 2, 3, 3, 3, 4};
+    std::vector<int> result;
+
+    std::unique_copy(v.begin(), v.end(), std::back_inserter(result));
+
+    for (int x : result) std::printf("%d ", x);
+    std::printf("\n");
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 unique_copy_demo.cpp -o unique_copy_demo
+./unique_copy_demo
+# 1 2 3 4
+```
+
+เช่นเดียวกับ `std::unique` ตรงๆ `std::unique_copy` ก็ยังคงกำจัดเฉพาะค่าซ้ำที่
+ติดกันเท่านั้น (`v` ในตัวอย่างนี้เรียงลำดับมาแล้วพอดี) ถ้าข้อมูลต้นฉบับยังไม่
+เรียงลำดับ ก็ยังต้อง `std::sort` ก่อนเสมอเช่นเดียวกับที่อธิบายไปข้างต้น
 
 ตลอด Part นี้เราใช้ **Lambda Expression** เป็น argument ให้กับ algorithm แทบทุก
 ตัว (`std::sort`, `std::find_if`, `std::transform`, `std::accumulate`,

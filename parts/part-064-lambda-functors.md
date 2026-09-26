@@ -145,6 +145,47 @@ reference) นี่คือจุดที่ต้องระวังเว
 ของ STL — ถ้าไม่รับค่าที่ algorithm คืนกลับมา state ที่สะสมไว้จะหายไปเมื่อ
 algorithm ทำงานจบ
 
+**Functor สำเร็จรูปจาก `<functional>`**: ก่อนที่ Lambda จะถือกำเนิดขึ้นใน
+C++11 ไลบรารีมาตรฐานมี Functor สำเร็จรูปให้ใช้แทนตัวดำเนินการพื้นฐานอยู่แล้ว
+เช่น `std::greater<T>`, `std::less<T>`, `std::plus<T>`, `std::multiplies<T>`
+ซึ่งปัจจุบันก็ยังมีประโยชน์อยู่ในกรณีที่ logic ง่ายมากจนไม่คุ้มจะเขียน lambda:
+
+```cpp
+#include <cstdio>
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <functional>
+
+int main(void) {
+    std::vector<int> v = {5, 3, 8, 1, 9};
+
+    // functor สำเร็จรูปจาก <functional> แทนการเขียน lambda เอง
+    std::sort(v.begin(), v.end(), std::greater<int>());
+    for (int x : v) std::printf("%d ", x);
+    std::printf("\n");
+
+    int product = std::accumulate(v.begin(), v.end(), 1, std::multiplies<int>());
+    std::printf("ผลคูณ: %d\n", product);
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 stdlib_functors.cpp -o stdlib_functors
+./stdlib_functors
+# 9 8 5 3 1
+# ผลคูณ: 1080
+```
+
+`std::greater<int>()` เขียนสั้นกว่า `[](int a, int b) { return a > b; }`
+เล็กน้อยและสื่อความหมายชัดเจนในตัวชื่อ (บอกตรงๆ ว่า "มากกว่า") ในโค้ดจริง
+หลายทีมนิยมใช้ functor สำเร็จรูปเหล่านี้แทน lambda สั้นๆ ที่ทำแค่ operation
+พื้นฐาน เพื่อความกระชับและอ่านง่ายกว่า แต่เมื่อ logic ซับซ้อนกว่าตัวดำเนินการ
+เดียว (เช่นตัวอย่าง multi-key sort ใน Part 63) Lambda ก็ยังคงเป็นตัวเลือกที่
+เหมาะสมกว่ามาก
+
 ---
 
 ## 64.3 Lambda Expression แบบละเอียด (Step 507)
