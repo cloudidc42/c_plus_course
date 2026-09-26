@@ -2266,3 +2266,791 @@ $ curl -s http://127.0.0.1:18480/products/7; echo
 | ผลลัพธ์ทดสอบซ้ำ (reproducibility) | ไม่แน่นอน (race condition ขึ้นกับ timing) | สม่ำเสมอทุกครั้งที่รันซ้ำ (ทดสอบแล้วที่ N=30 และ N=50) |
 
 ---
+
+## 121.8 ประกอบร่างทั้งระบบ, ทดสอบ End-to-End เต็มรูปแบบ และ Docker (Step 968)
+
+### `src/main.cpp` — จุดประกอบร่างทุกชิ้น
+
+```cpp
+#include "crow.h"
+#include "db.hpp"
+#include "auth_middleware.hpp"
+#include "routes_catalog.hpp"
+#include "routes_auth.hpp"
+#include "routes_orders.hpp"
+#include "response.hpp"
+#include <cstdlib>
+#include <string>
+
+// อ่านค่าจาก environment variable พร้อม fallback ค่า default (แนวคิดจาก Part 112)
+static std::string get_env_or(const char* key, const std::string& fallback) {
+    const char* val = std::getenv(key);
+    return val ? std::string(val) : fallback;
+}
+
+int main() {
+    crow::App<AuthMiddleware> app;
+
+    std::string conn_string = get_env_or(
+        "DATABASE_URL",
+        "host=127.0.0.1 port=5432 dbname=ecommercedb user=ecomuser password=ecom_pass123"
+    );
+    int port = std::stoi(get_env_or("PORT", "18480"));
+    std::size_t pool_size = std::stoul(get_env_or("DB_POOL_SIZE", "8"));
+
+    Db db(conn_string, pool_size);
+
+    register_auth_routes(app, db);
+    register_catalog_routes(app, db);
+    register_order_routes(app, db);
+
+    CROW_ROUTE(app, "/health")
+    ([]() {
+        return api::ok(nlohmann::json{{"status", "up"}}, 200);
+    });
+
+    app.port(port).multithreaded().run();
+}
+```
+
+`main.cpp` มีความยาวไม่ถึง 40 บรรทัด แต่ทำหน้าที่ "ประกอบร่าง" ที่ชัดเจน: อ่าน config จาก
+environment variable (`DATABASE_URL`, `PORT`, `DB_POOL_SIZE`) ตามแนวคิด 12-Factor App จาก
+Part 112, สร้าง `Db` หนึ่งตัว, ลงทะเบียน route ทั้งสามกลุ่ม แล้วเปิด server
+
+รัน server จริงบนเครื่องทดสอบ:
+
+```bash
+$ ./build/ecommerce_api
+(2026-09-26 12:29:51) [INFO    ] Crow/master server is running at http://0.0.0.0:18480 using 4 threads
+(2026-09-26 12:29:51) [INFO    ] Call `app.loglevel(crow::LogLevel::Warning)` to hide Info level logs.
+```
+
+### ทดสอบ End-to-End เต็มรูปแบบ: Customer Journey จริงทีละขั้นตอน
+
+ทดสอบทั้งระบบตั้งแต่ต้นจนจบด้วยฐานข้อมูลที่ล้างใหม่สะอาด (reseed schema + categories)
+ครอบคลุมทั้ง happy path และทุก error case ที่ออกแบบไว้ ผลลัพธ์ทั้งหมดด้านล่างนี้คือ output จริง
+จากการรันสคริปต์ `full_journey_test.sh` บนเซิร์ฟเวอร์ที่กำลังทำงานอยู่จริง
+
+**ขั้นตอน 1–2: Health check และดูหมวดหมู่สินค้า (ไม่ต้อง login)**
+
+```bash
+$ curl -s -i http://127.0.0.1:18480/health
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"data":{"status":"up"},"success":true}
+
+$ curl -s -i http://127.0.0.1:18480/categories
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 261
+
+{"data":[{"id":1,"name":"อุปกรณ์อิเล็กทรอนิกส์","slug":"electronics"},{"id":2,"name":"เสื้อผ้าแฟชั่น","slug":"fashion"},{"id":3,"name":"หนังสือ","slug":"books"}],"success":true}
+```
+
+**ขั้นตอน 3–5: สมัครสมาชิก 2 บัญชี และทดสอบ username ซ้ำ**
+
+```bash
+$ curl -s -i -X POST http://127.0.0.1:18480/auth/register -H "Content-Type: application/json" \
+  -d '{"username":"somchai","password":"MyP@ssw0rd1"}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"data":{"id":1,"role":"customer","username":"somchai"},"success":true}
+
+$ curl -s -i -X POST http://127.0.0.1:18480/auth/register -H "Content-Type: application/json" \
+  -d '{"username":"adminuser","password":"AdminP@ss1"}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"data":{"id":2,"role":"customer","username":"adminuser"},"success":true}
+
+$ curl -s -i -X POST http://127.0.0.1:18480/auth/register -H "Content-Type: application/json" \
+  -d '{"username":"somchai","password":"AnotherPass1"}'
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+
+{"error":{"code":"USERNAME_TAKEN","message":"ชื่อผู้ใช้ \"somchai\" ถูกใช้ไปแล้ว"},"success":false}
+```
+
+โปรโมท `adminuser` เป็น admin ผ่าน DB โดยตรง (ตามหลักการที่อธิบายไว้ใน 121.4):
+
+```bash
+$ PGPASSWORD=ecom_pass123 psql -h 127.0.0.1 -U ecomuser -d ecommercedb \
+  -c "UPDATE users SET role='admin' WHERE username='adminuser';"
+UPDATE 1
+```
+
+**ขั้นตอน 6–8: Login ทั้งสองบัญชี และทดสอบรหัสผ่านผิด**
+
+```bash
+$ curl -s -X POST http://127.0.0.1:18480/auth/login -H "Content-Type: application/json" \
+  -d '{"username":"somchai","password":"MyP@ssw0rd1"}'
+{"data":{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...UywQYYRR2hdhZNK7Bt2gJYPL1kHcBdro4m3-8VBBfwU","expires_in":3600,"role":"customer","token_type":"Bearer"},"success":true}
+
+$ curl -s -X POST http://127.0.0.1:18480/auth/login -H "Content-Type: application/json" \
+  -d '{"username":"adminuser","password":"AdminP@ss1"}'
+{"data":{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...hdmfNbgYewfp0S2TRwHzo4EDHjww4gQC3PutiZclnOE","expires_in":3600,"role":"admin","token_type":"Bearer"},"success":true}
+
+$ curl -s -i -X POST http://127.0.0.1:18480/auth/login -H "Content-Type: application/json" \
+  -d '{"username":"somchai","password":"WrongPassword1"}'
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+
+{"error":{"code":"INVALID_CREDENTIALS","message":"username หรือ password ไม่ถูกต้อง"},"success":false}
+```
+
+**ขั้นตอน 9–10: RBAC — customer และผู้ไม่มี token ห้ามสร้างสินค้า**
+
+```bash
+$ curl -s -i -X POST http://127.0.0.1:18480/products -H "Authorization: Bearer $CUST_TOKEN" \
+  -H "Content-Type: application/json" -d '{"category_id":1,"sku":"KB-001","name":"x","price_cents":1,"stock":1}'
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{"error":{"code":"FORBIDDEN","message":"เฉพาะผู้ดูแลระบบ (admin) เท่านั้นที่สร้างสินค้าได้"},"success":false}
+
+$ curl -s -i -X POST http://127.0.0.1:18480/products -H "Content-Type: application/json" \
+  -d '{"category_id":1,"sku":"KB-001","name":"x","price_cents":1,"stock":1}'
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+
+{"error":{"code":"MISSING_TOKEN","message":"ต้องแนบ header Authorization: Bearer <token>"},"success":false}
+```
+
+สังเกตความต่างระหว่าง `403` (มี token แต่ไม่มีสิทธิ์) กับ `401` (ไม่มี token เลย) — นี่คือการใช้
+HTTP status code ให้ตรงความหมายตามหลักการ REST ของ Part 108: `401 Unauthorized` แปลว่า "ยัง
+ไม่ได้พิสูจน์ตัวตน" ส่วน `403 Forbidden` แปลว่า "พิสูจน์ตัวตนแล้ว แต่ไม่มีสิทธิ์ทำสิ่งนี้"
+
+**ขั้นตอน 11–13: Admin สร้างสินค้า 5 รายการ และทดสอบ error case**
+
+```bash
+$ curl -s -i -X POST http://127.0.0.1:18480/products -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"category_id":1,"sku":"KB-001","name":"คีย์บอร์ดกลไก RGB","description":"คีย์บอร์ดเกมมิ่งสวิตช์บราวน์","price_cents":129000,"stock":10}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"data":{"category_id":1,"category_name":"อุปกรณ์อิเล็กทรอนิกส์","description":"คีย์บอร์ดเกมมิ่งสวิตช์บราวน์","id":1,"name":"คีย์บอร์ดกลไก RGB","price_cents":129000,"sku":"KB-001","stock":10},"success":true}
+```
+
+(สร้างต่ออีก 4 รายการด้วยวิธีเดียวกัน: เมาส์ไร้สาย stock=50, เสื้อยืด stock=100, หนังสือ C++
+stock=3, หูฟังลิมิเต็ด stock=10 — ทั้งหมดได้ `201 Created` เหมือนกัน)
+
+```bash
+$ curl -s -i -X POST http://127.0.0.1:18480/products -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" -d '{"category_id":1,"sku":"KB-001","name":"ซ้ำ","price_cents":1,"stock":1}'
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+
+{"error":{"code":"SKU_TAKEN","message":"sku นี้ถูกใช้ไปแล้ว"},"success":false}
+
+$ curl -s -i -X POST http://127.0.0.1:18480/products -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" -d '{"category_id":999,"sku":"ZZ-001","name":"ไม่มีหมวดหมู่","price_cents":1,"stock":1}'
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+
+{"error":{"code":"INVALID_CATEGORY","message":"ไม่พบ category_id ที่ระบุ"},"success":false}
+```
+
+**ขั้นตอน 14–18: เรียกดูสินค้าด้วย filter/search/pagination**
+
+```bash
+$ curl -s "http://127.0.0.1:18480/products?page=1&limit=2"
+{"data":{"items":[...คีย์บอร์ด...,...เมาส์...],"limit":2,"page":1,"total_count":5,"total_pages":3},"success":true}
+
+$ curl -s "http://127.0.0.1:18480/products?category_id=1"
+{"data":{"items":[...3 รายการในหมวดอิเล็กทรอนิกส์...],"limit":20,"page":1,"total_count":3,"total_pages":1},"success":true}
+
+$ curl -s "http://127.0.0.1:18480/products?search=เมาส์"
+{"data":{"items":[{"...":"...","name":"เมาส์ไร้สาย",...}],"limit":20,"page":1,"total_count":1,"total_pages":1},"success":true}
+
+$ curl -s -i http://127.0.0.1:18480/products/9999
+HTTP/1.1 404 Not Found
+{"error":{"code":"PRODUCT_NOT_FOUND","message":"ไม่พบสินค้า id = 9999"},"success":false}
+```
+
+**ขั้นตอน 19: Admin แก้ไขราคาสินค้า (partial update)**
+
+```bash
+$ curl -s -i -X PUT http://127.0.0.1:18480/products/2 -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" -d '{"price_cents":55000}'
+HTTP/1.1 200 OK
+
+{"data":{"...","id":2,"name":"เมาส์ไร้สาย","price_cents":55000,"sku":"MS-001","stock":50},"success":true}
+```
+
+ส่งแค่ `price_cents` โดยไม่แตะฟิลด์อื่น และฟิลด์อื่นทั้งหมด (`name`, `description`, `stock`)
+ยังคงค่าเดิมไว้ครบ — partial update ทำงานถูกต้องตามที่ออกแบบไว้ (แพทเทิร์นเดียวกับ `PUT
+/tasks/<id>` ใน Part 108)
+
+**ขั้นตอน 20–24: ลูกค้าสั่งซื้อสินค้า — หัวใจของระบบ**
+
+```bash
+$ curl -s -i -X POST http://127.0.0.1:18480/orders -H "Content-Type: application/json" \
+  -d '{"items":[{"product_id":1,"quantity":1}]}'
+HTTP/1.1 401 Unauthorized
+{"error":{"code":"MISSING_TOKEN","message":"ต้องแนบ header Authorization: Bearer <token>"},"success":false}
+
+$ curl -s -i -X POST http://127.0.0.1:18480/orders -H "Authorization: Bearer $CUST_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"items":[{"product_id":1,"quantity":2},{"product_id":2,"quantity":1}]}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"data":{"created_at":"2026-09-26 12:30:31.480157+00","id":1,"items":[{"line_total_cents":258000,"product_id":1,"product_name":"คีย์บอร์ดกลไก RGB","quantity":2,"unit_price_cents":129000},{"line_total_cents":55000,"product_id":2,"product_name":"เมาส์ไร้สาย","quantity":1,"unit_price_cents":55000}],"status":"placed","total_cents":313000,"user_id":1},"success":true}
+
+$ curl -s http://127.0.0.1:18480/products/1; echo
+{"data":{...,"id":1,"stock":8},"success":true}
+$ curl -s http://127.0.0.1:18480/products/2; echo
+{"data":{...,"id":2,"stock":49},"success":true}
+```
+
+สต็อกคีย์บอร์ดลดจาก 10 เหลือ 8 (สั่งไป 2) และเมาส์ลดจาก 50 เหลือ 49 (สั่งไป 1) — ตรงตามที่
+ออกแบบไว้ทุกประการ ราคารวม `total_cents = 313000` คำนวณถูกต้อง (2×129000 + 1×55000 = 313000
+สตางค์ = 3,130.00 บาท)
+
+```bash
+$ curl -s -i -X POST http://127.0.0.1:18480/orders -H "Authorization: Bearer $CUST_TOKEN" \
+  -H "Content-Type: application/json" -d '{"items":[{"product_id":4,"quantity":100}]}'
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+
+{"error":{"code":"INSUFFICIENT_STOCK","message":"สินค้า \"คู่มือ C++ ฉบับสมบูรณ์\" มีไม่พอ (ต้องการ 100 มีในสต็อก 3)"},"success":false}
+
+$ curl -s http://127.0.0.1:18480/products/4; echo
+{"data":{...,"id":4,"stock":3},"success":true}
+```
+
+หนังสือมี stock=3 แต่สั่ง 100 เล่ม → ถูกปฏิเสธด้วย `409` ตามคาด และ **stock ยังคงเป็น 3 เท่าเดิม
+ไม่ถูกแตะแม้แต่น้อย** — พิสูจน์ว่า transaction rollback ทำงานถูกต้องสมบูรณ์ (ไม่ใช่แค่ order
+ทั้งใบถูกยกเลิก แต่ผลข้างเคียงทุกอย่างในทรานแซกชันถูกย้อนกลับหมด)
+
+```bash
+$ curl -s -i -X POST http://127.0.0.1:18480/orders -H "Authorization: Bearer $CUST_TOKEN" \
+  -H "Content-Type: application/json" -d '{"items":[{"product_id":9999,"quantity":1}]}'
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+
+{"error":{"code":"PRODUCT_NOT_FOUND","message":"ไม่พบสินค้า id = 9999"},"success":false}
+```
+
+**ขั้นตอน 26–28: ดูประวัติคำสั่งซื้อ และทดสอบสิทธิ์ความเป็นเจ้าของ**
+
+```bash
+$ curl -s -i http://127.0.0.1:18480/orders -H "Authorization: Bearer $CUST_TOKEN"
+HTTP/1.1 200 OK
+
+{"data":[{"created_at":"2026-09-26 12:30:31.480157+00","id":1,"items":[...],"status":"placed","total_cents":313000,"user_id":1}],"success":true}
+
+$ curl -s -i http://127.0.0.1:18480/orders/1 -H "Authorization: Bearer $CUST_TOKEN"
+HTTP/1.1 200 OK
+{"data":{...,"id":1,...},"success":true}
+
+$ curl -s -i http://127.0.0.1:18480/orders/1 -H "Authorization: Bearer $ADMIN_TOKEN"
+HTTP/1.1 404 Not Found
+Content-Type: application/json
+
+{"error":{"code":"ORDER_NOT_FOUND","message":"ไม่พบ order id = 1"},"success":false}
+```
+
+**Order id=1 เป็นของ `somchai` ไม่ใช่ของ `adminuser`** — เมื่อ adminuser (ซึ่งเป็นบัญชีที่มี
+สิทธิ์สูงกว่าด้วยซ้ำในแง่ role) พยายามเรียกดู order นี้ ระบบคืน `404 Not Found` (ไม่ใช่ `403
+Forbidden`) ตามหลักการที่อธิบายไว้ใน 121.6 — ป้องกันไม่ให้ผู้ใช้คนอื่นรู้ได้แม้แต่ว่า "order
+id=1 มีอยู่จริงในระบบ" ทั้งหมด 28 ขั้นตอนของ customer journey เต็มรูปแบบผ่านตามที่ออกแบบไว้ทุก
+ประการ บน server จริงที่รันด้วย `g++ 13.3.0` + Crow + libpqxx 7.8.1 + PostgreSQL 16.15
+
+### Docker: Multi-stage Build (โค้ดอ้างอิง — ไม่ได้รัน `docker build` จริงในสภาพแวดล้อมนี้)
+
+> **สถานะการทดสอบของหัวข้อนี้ (สำคัญมาก อ่านก่อนเริ่ม)**: เหมือนกับที่แจ้งไว้ชัดเจนใน
+> Part 112 — เครื่องที่ใช้เขียนบทเรียนนี้เป็น sandboxed container ที่ไม่มี Docker daemon ทำงาน
+> อยู่:
+>
+> ```bash
+> $ docker info
+> Client: Docker Engine - Community
+>  Version:    29.3.1
+> ...
+> Server:
+> failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is
+> correct and if the daemon is running: dial unix /var/run/docker.sock: connect: no such file
+> or directory
+> ```
+>
+> Docker CLI ติดตั้งอยู่ (`docker`, `docker compose`, `docker buildx` ครบ) แต่ **ไม่มี daemon
+> ให้เชื่อมต่อ** จึงไม่สามารถรัน `docker build`/`docker compose up` จริงได้ในสภาพแวดล้อมนี้
+> เนื้อหา `Dockerfile` และ `docker-compose.yml` ด้านล่างเขียนและตรวจทานอย่างละเอียดถูกต้องตาม
+> หลักปฏิบัติจริง (Multi-stage build, non-root user, healthcheck) ต่อยอดจากแพทเทิร์นที่พิสูจน์
+> แล้วว่าใช้งานได้จริงใน Part 112 แต่ **ไม่มีผลลัพธ์จาก terminal จริงมาแสดงในหัวข้อนี้** — สิ่งที่
+> ทดสอบจริงคือ **ตัวโปรแกรม C++ (คอมไพล์ตรงด้วย CMake) และการเชื่อมต่อ PostgreSQL** ซึ่งเป็น
+> เนื้อหาหลักของทั้งบทเรียน
+
+`Dockerfile`:
+
+```dockerfile
+# ============================================================
+# Stage 1: "builder" — toolchain เต็มรูปแบบสำหรับ compile เท่านั้น
+# ============================================================
+FROM ubuntu:24.04 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    pkg-config \
+    git \
+    ca-certificates \
+    libpqxx-dev \
+    libssl-dev \
+    libsodium-dev \
+    nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Crow เป็น header-only library — pin เวอร์ชันด้วย tag ที่แน่นอนเพื่อ reproducibility
+RUN git clone --branch v1.2.0 --depth 1 \
+    https://github.com/CrowCpp/Crow.git /tmp/crow \
+    && cp -r /tmp/crow/include/* /usr/local/include/ \
+    && rm -rf /tmp/crow
+
+WORKDIR /build
+COPY CMakeLists.txt .
+COPY include/ include/
+COPY src/ src/
+
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build -j"$(nproc)"
+
+# ============================================================
+# Stage 2: "runtime" — image สุดท้ายที่จะถูก deploy จริง เบาที่สุดเท่าที่ทำได้
+# ============================================================
+FROM ubuntu:24.04 AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpqxx-7.8 \
+    libssl3 \
+    libsodium23 \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin appuser
+
+WORKDIR /app
+COPY --from=builder /build/build/ecommerce_api /app/ecommerce_api
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 18480
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://127.0.0.1:18480/health || exit 1
+
+CMD ["/app/ecommerce_api"]
+```
+
+`docker-compose.yml`:
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ecomuser
+      POSTGRES_PASSWORD: ecom_pass123
+      POSTGRES_DB: ecommercedb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./seed_categories.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ecomuser -d ecommercedb"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ecommerce_net
+    # ไม่ expose 5432 ออกสู่ host เพราะไม่มีความจำเป็นให้เครื่องภายนอกต่อ DB ตรงๆ
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "host=db port=5432 dbname=ecommercedb user=ecomuser password=ecom_pass123"
+      PORT: "18480"
+      JWT_SECRET: "${JWT_SECRET:?กรุณาตั้งค่า JWT_SECRET ใน .env ก่อน docker compose up}"
+    ports:
+      - "18480:18480"
+    networks:
+      - ecommerce_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:18480/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+networks:
+  ecommerce_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+```
+
+จุดที่ควรสังเกตเพิ่มเติมจากแพทเทิร์นของ Part 112:
+
+1. **`volumes` ของ service `db` mount ไฟล์ `schema.sql` และ `seed_categories.sql` เข้าไปที่
+   `/docker-entrypoint-initdb.d/`** — นี่คือ hook พิเศษของ PostgreSQL Docker image ที่รันสคริปต์
+   ทุกไฟล์ในโฟลเดอร์นี้โดยอัตโนมัติแค่ครั้งเดียวตอน container ถูกสร้างครั้งแรก (initial data
+   directory ยังว่างอยู่) ทำให้ schema พร้อมใช้งานทันทีที่ `docker compose up` เสร็จ โดยไม่ต้อง
+   รันคำสั่ง SQL แยกเอง
+2. **`JWT_SECRET: "${JWT_SECRET:?...}"`** — syntax นี้ของ Docker Compose บังคับให้ต้องตั้งค่า
+   ตัวแปรสภาพแวดล้อม `JWT_SECRET` ไว้ก่อนเสมอ (ผ่านไฟล์ `.env` หรือ shell environment) ถ้าไม่ตั้ง
+   `docker compose up` จะ**ปฏิเสธทันทีพร้อมข้อความ error ที่กำหนดเอง** แทนที่จะปล่อยให้ระบบรันไป
+   ด้วยค่า default ที่ไม่ปลอดภัย (`dev-only-secret-change-me-in-production` จาก
+   `auth_middleware.hpp`) นี่คือการบังคับใช้กฎ "ห้าม hardcode secret" ในระดับ infrastructure
+   ไม่ใช่แค่คำแนะนำในคอมเมนต์เฉยๆ
+
+### รันด้วย CMake ตรงๆ vs รันผ่าน Docker: สรุปสิ่งที่ทดสอบจริง
+
+| วิธีการรัน | ทดสอบจริงในบทเรียนนี้หรือไม่ |
+|---|---|
+| `cmake --build` + รัน `./ecommerce_api` ตรงบนเครื่อง เชื่อม PostgreSQL native | ✅ ทดสอบจริงทั้งหมด (ทุกหัวข้อ 121.1–121.8) |
+| `docker build -t ecommerce-api .` | 📄 อ้างอิงเท่านั้น — ไม่มี Docker daemon ในสภาพแวดล้อมนี้ |
+| `docker compose up -d --build` | 📄 อ้างอิงเท่านั้น — เช่นเดียวกัน |
+| Connection string/credential ในไฟล์ `docker-compose.yml` | ✅ รูปแบบเดียวกันถูกทดสอบจริงผ่าน PostgreSQL ที่ติดตั้งแบบ native (`host=127.0.0.1` แทน `host=db`) |
+
+---
+
+## ข้อผิดพลาดที่พบบ่อย (Common Pitfalls)
+
+1. **แชร์ `pqxx::connection` ตัวเดียวข้าม thread โดยไม่มี pool** — นี่คือบั๊กจริงที่เจอในหัวข้อ
+   121.7 ของบทเรียนนี้เอง ต่างจาก SQLite (Part 108) ที่ปลอดภัยเพราะคอมไพล์แบบ Serialized mode
+   `pqxx::connection` **ไม่มี** การป้องกันแบบนั้นให้ ถ้าลืมใช้ `ConnectionPool` แล้วปล่อยให้หลาย
+   worker thread ของ Crow เรียก connection เดียวกันพร้อมกัน จะได้ error ที่คาดเดาไม่ได้ เช่น
+   "Lost connection to the database server" และ connection ทั้งตัวอาจพังจนต้อง restart server
+2. **Race Condition แบบ Check-Then-Act ตอนลด stock** — เขียน `SELECT stock ...` แล้วเช็คในโค้ด
+   C++ ก่อนค่อย `UPDATE stock = stock - N` แยกกันคนละคำสั่ง (ไม่ได้ล็อกแถวไว้) จะทำให้หลาย
+   request ที่มาพร้อมกันอ่านค่า stock เดิมได้พร้อมกันทั้งคู่ แล้วต่างฝ่ายต่างคิดว่ามีของพอ
+   ผลคือขายสินค้าเกินสต็อกจริง (Overselling) ต้องใช้ `SELECT ... FOR UPDATE` ภายใน transaction
+   เดียวกับ `UPDATE` เสมอ (ดู 121.6)
+3. **ล็อกทรัพยากรหลายตัวไม่เรียงลำดับ** — ถ้า order หนึ่งล็อกสินค้าตามลำดับที่ client ส่งมาตรงๆ
+   (ไม่ `sort` ก่อน) สอง order ที่สั่งสินค้าชุดเดียวกันแต่ส่งลำดับต่างกันอาจเกิด **Deadlock**
+   ต้องบังคับล็อกตามลำดับคงที่เดียวกันเสมอ (เช่น เรียงตาม `product_id` จากน้อยไปมาก) ไม่ว่า
+   client จะส่งลำดับมาแบบไหนก็ตาม
+4. **ลืม `txn.commit()`** — เหมือนที่เตือนไว้ใน Part 106.6 การลืม commit จะทำให้ transaction
+   rollback แบบเงียบๆ โดยไม่มี error ใดๆ แจ้งเตือน ข้อมูลจะดูเหมือนหายไปอย่างไร้ร่องรอย ต้อง
+   ตรวจสอบทุกจุดที่เขียนข้อมูลว่ามี `commit()` ครบถ้วนเสมอ
+5. **N+1 Query Problem** — ดึงรายการสินค้ามาก่อนแล้ว query ชื่อหมวดหมู่แยกทีละตัวในลูป แทนที่
+   จะ `JOIN` ครั้งเดียว จะทำให้จำนวน query โตเป็นเส้นตรงตามจำนวนแถว ระบบจะช้าลงอย่างรุนแรงเมื่อ
+   ข้อมูลเยอะขึ้น (ดูตัวอย่างเปรียบเทียบเต็มรูปแบบใน 121.5)
+6. **อนุญาตให้ client กำหนด `role` ของตัวเองตอนสมัครสมาชิก (Privilege Escalation)** — ถ้า
+   `POST /auth/register` รับค่า `"role"` จาก request body มาใช้ตรงๆ ใครก็สามารถสมัครเป็น admin
+   ได้ทันที endpoint นี้ต้องบังคับ `role = "customer"` เสมอไม่มีข้อยกเว้น ส่วนบัญชี admin ต้อง
+   สร้างผ่านการ seed ฐานข้อมูลโดยตรงเท่านั้น (ดู 121.4)
+7. **JWT ที่ออกไปแล้วยัง "จำ" role เก่าอยู่จนกว่าจะหมดอายุ** — ถ้าโปรโมท/ลดสิทธิ์ผู้ใช้กลางคัน
+   (เช่น เปลี่ยนจาก `admin` เป็น `customer` เพราะพนักงานลาออก) JWT เก่าที่ยังไม่หมดอายุจะยัง
+   มี `role` เดิมฝังอยู่ในตัวเอง เพราะ JWT เป็น Stateless (Part 110.3) — ผู้ใช้คนนั้นจะยังใช้
+   สิทธิ์เดิมได้จนกว่า token จะหมดอายุจริง แนวทางแก้คือตั้ง `exp` ให้สั้น (15–60 นาที) และถ้า
+   ต้องการเพิกถอนสิทธิ์ทันทีต้องมีกลไกเพิ่มเติม เช่น token blacklist หรือเปลี่ยนไปใช้ session
+   ที่ query ฐานข้อมูลทุกครั้ง (แลกกับความเร็วที่ลดลง)
+8. **เขียน `param_idx++` สองครั้งในนิพจน์เดียวกันตอนสร้าง SQL แบบ dynamic** — เช่น
+   `"LIMIT $" + std::to_string(param_idx++) + " OFFSET $" + std::to_string(param_idx++)` ใน
+   บรรทัดเดียว ลำดับการประเมินผลของ `operator+` ต่อเนื่องกันไม่ได้ถูกกำหนดไว้ตายตัวในมาตรฐาน
+   C++ (Unsequenced/Sequence Point) คอมไพเลอร์อาจประเมินฝั่งขวาก่อนฝั่งซ้ายก็ได้ ทำให้ตัวเลข
+   placeholder ที่ได้ผิดลำดับโดยไม่มี warning เตือนชัดเจน (ทดสอบจริงพบ warning
+   `-Wsequence-point` ในหัวข้อ 121.3 ระหว่างพัฒนา) — ต้องแยกเป็นตัวแปรก่อนเสมอเมื่อมีการ
+   increment มากกว่าหนึ่งครั้งในนิพจน์เดียว
+9. **ตรวจสอบ ownership ใน C++ แทนที่จะให้ SQL query เช็คให้** — เช่น query แค่
+   `SELECT * FROM orders WHERE id = $1` แล้วเอา `user_id` ที่ได้มาเทียบกับผู้ใช้ปัจจุบันใน C++
+   ทีหลัง เสี่ยงต่อบั๊กจากการลืมเช็ค `if` เงื่อนไข ควรใส่เงื่อนไข ownership เข้าไปใน `WHERE`
+   clause ตรงๆ (`WHERE id = $1 AND user_id = $2`) ให้ฐานข้อมูลเป็นผู้บังคับกฎให้เสมอ
+10. **คืน `403 Forbidden` แทน `404 Not Found` เมื่อผู้ใช้พยายามดู resource ของคนอื่น** — การคืน
+    `403` บอกผู้โจมตีทางอ้อมว่า "resource นี้มีอยู่จริงในระบบ แต่คุณไม่มีสิทธิ์ดู" ซึ่งเปิดช่อง
+    ให้ไล่เดา id ทีละตัวเพื่อสำรวจว่า order/ข้อมูลใดมีอยู่จริงบ้าง (คล้ายกับ User Enumeration
+    Attack ใน Part 110) ควรคืน `404` เสมอไม่ว่า resource จะไม่มีอยู่จริง หรือมีอยู่แต่ไม่ใช่ของ
+    ผู้ใช้คนนี้
+11. **ลืมใส่ Index บนคอลัมน์ Foreign Key** — PostgreSQL ไม่สร้าง index ให้อัตโนมัติที่ฝั่ง FK
+    (ต่างจาก Primary Key ที่มี index มาให้เสมอ) ถ้าลืมสร้าง `idx_products_category_id` หรือ
+    `idx_orders_user_id` เอง query ที่ filter ตามคอลัมน์เหล่านี้จะช้าลงอย่างมากเมื่อข้อมูลโต
+    (PostgreSQL ต้อง Sequential Scan ทั้งตาราง)
+12. **ใช้ `FLOAT`/`DOUBLE` เก็บราคาสินค้า** — Floating point มี rounding error โดยธรรมชาติ
+    (`0.1 + 0.2 != 0.3`) ห้ามใช้กับเงินเด็ดขาด ต้องใช้จำนวนเต็มหน่วยสตางค์ (ตามบทเรียนนี้) หรือ
+    `NUMERIC` (ตาม Part 106) เท่านั้น
+
+---
+
+## แบบฝึกหัดท้ายบท
+
+1. **เพิ่มระบบคูปอง/ส่วนลด (Coupon System)** — เพิ่มตาราง `coupons` (`code`, `discount_percent`,
+   `max_uses`, `used_count`, `active`) และแก้ `POST /orders` ให้รับฟิลด์ `coupon_code` (ไม่บังคับ)
+   คำนวณส่วนลดจาก `total_cents` ก่อนบันทึก และต้องเพิ่ม `used_count` แบบปลอดภัยจาก race condition
+   เช่นเดียวกับที่ทำกับ `stock` (คูปองที่ใช้ครบ `max_uses` แล้วต้องถูกปฏิเสธ ไม่ว่าจะมีกี่
+   request มาพร้อมกันก็ตาม)
+2. **เพิ่มระบบรีวิวสินค้า (Product Reviews)** — เพิ่มตาราง `reviews` (`product_id`, `user_id`,
+   `rating` 1-5, `comment`) พร้อม endpoint `POST /products/<id>/reviews` (ต้อง login และเคยสั่ง
+   ซื้อสินค้านั้นมาก่อนเท่านั้นถึงจะรีวิวได้ — "Verified Purchase") และ `GET /products/<id>/reviews`
+   พร้อมคำนวณค่าเฉลี่ยดาว (average rating) แสดงรวมไปกับ `GET /products/<id>`
+3. **เพิ่ม endpoint ยกเลิกคำสั่งซื้อ `POST /orders/<id>/cancel`** — ต้องเป็นเจ้าของ order เท่านั้น
+   และต้องเป็น order ที่สถานะยัง `placed` อยู่ (ยกเลิกซ้ำไม่ได้) เมื่อยกเลิกสำเร็จต้อง **คืน
+   stock กลับเข้าคลังสินค้าทุกรายการในทรานแซกชันเดียว** (ใช้หลักการเดียวกับ `place_order()`
+   ในหัวข้อ 121.6 แต่ทำตรงข้ามกัน — บวกกลับแทนที่จะลบออก) แล้วเปลี่ยน `status` เป็น `cancelled`
+4. **เปลี่ยนจากการลบสินค้าจริง (Hard Delete) เป็น Soft Delete** — เพิ่มคอลัมน์
+   `is_active BOOLEAN NOT NULL DEFAULT true` ในตาราง `products` เปลี่ยน `DELETE
+   /products/<id>` (endpoint ใหม่ที่ต้องเพิ่ม) ให้ตั้งค่า `is_active = false` แทนที่จะลบแถวจริง
+   และแก้ `list_products()`/`find_product_by_id()` ให้กรองเฉพาะ `is_active = true` เป็นค่า
+   default (อธิบายว่าทำไมวิธีนี้ปลอดภัยกว่าการลบจริงสำหรับสินค้าที่เคยถูกสั่งซื้อไปแล้ว)
+5. **เพิ่ม Sales Report สำหรับ Admin** — endpoint ใหม่ `GET /admin/reports/sales` (admin
+   เท่านั้น) ที่คืนยอดขายรวม (`SUM(total_cents)`), จำนวน order ทั้งหมด, และ Top 5 สินค้าขายดี
+   ที่สุด (`GROUP BY product_id ORDER BY SUM(quantity) DESC LIMIT 5`) ภายในช่วงวันที่ที่รับผ่าน
+   query parameter `?from=2026-01-01&to=2026-12-31`
+6. **เพิ่ม Rate Limiting ป้องกัน Brute-Force บน `/auth/login`** — เขียน Middleware ใหม่ (ใช้
+   `std::unordered_map<std::string, std::vector<time_point>>` เก็บ timestamp ของความพยายาม
+   login ล่าสุดต่อ IP พร้อม `std::mutex` ป้องกัน) ที่ปฏิเสธด้วย `429 Too Many Requests` ถ้า IP
+   เดียวกันพยายาม login ผิดเกิน 5 ครั้งภายใน 1 นาที (คำใบ้: ทบทวนแนวคิด Middleware จาก Part
+   110.5 และ `std::chrono` จาก Part 60)
+
+### แนวทางเฉลยข้อ 1: ระบบคูปองส่วนลด
+
+เพิ่มตารางในไฟล์ `schema.sql`:
+
+```sql
+CREATE TABLE coupons (
+    id                SERIAL PRIMARY KEY,
+    code              TEXT NOT NULL UNIQUE,
+    discount_percent  INTEGER NOT NULL CHECK (discount_percent BETWEEN 1 AND 100),
+    max_uses          INTEGER NOT NULL CHECK (max_uses > 0),
+    used_count        INTEGER NOT NULL DEFAULT 0 CHECK (used_count >= 0),
+    active            BOOLEAN NOT NULL DEFAULT true
+);
+```
+
+เพิ่มเมธอดใน `Db` ที่ล็อกแถวคูปองด้วย `FOR UPDATE` **ภายใน transaction เดียวกับ `place_order`**
+เพื่อป้องกัน race condition แบบเดียวกับ stock (ถ้าคูปองเหลือใช้ได้อีก 1 ครั้ง แต่มี 2 request
+มาพร้อมกัน ต้องมีแค่ request เดียวเท่านั้นที่ใช้คูปองสำเร็จ):
+
+```cpp
+// เพิ่มใน db.hpp
+Order place_order(int user_id, const std::vector<OrderLineRequest>& lines,
+                   const std::optional<std::string>& coupon_code);
+
+// เพิ่มใน db.cpp — แทรกก่อนขั้นตอนสร้าง order (หลังคำนวณ total_cents จาก stock ทุกตัวแล้ว)
+long long discount_percent = 0;
+std::optional<int> coupon_id;
+if (coupon_code.has_value()) {
+    pqxx::result coupon_rows = txn.exec_params(
+        "SELECT id, discount_percent, max_uses, used_count, active "
+        "FROM coupons WHERE code = $1 FOR UPDATE;",   // ล็อกแถวคูปองเหมือนที่ล็อกสินค้า
+        *coupon_code
+    );
+    if (coupon_rows.empty() || !coupon_rows[0]["active"].as<bool>()) {
+        throw std::runtime_error("ไม่พบคูปองนี้ หรือคูปองถูกปิดใช้งานแล้ว");
+    }
+    int used = coupon_rows[0]["used_count"].as<int>();
+    int max_uses = coupon_rows[0]["max_uses"].as<int>();
+    if (used >= max_uses) {
+        throw std::runtime_error("คูปองนี้ถูกใช้ครบจำนวนที่กำหนดแล้ว");
+    }
+    discount_percent = coupon_rows[0]["discount_percent"].as<long long>();
+    coupon_id = coupon_rows[0]["id"].as<int>();
+
+    // เพิ่ม used_count ทันทีในทรานแซกชันเดียวกัน (ยังไม่ commit) — ปลอดภัยเพราะแถวถูกล็อกไว้แล้ว
+    txn.exec_params("UPDATE coupons SET used_count = used_count + 1 WHERE id = $1;", *coupon_id);
+}
+
+long long final_total = total_cents - (total_cents * discount_percent / 100);
+// ใช้ final_total แทน total_cents ตอน INSERT INTO orders
+```
+
+จุดสำคัญที่สุดของเฉลยนี้: การล็อกคูปองด้วย `FOR UPDATE` **ในทรานแซกชันเดียวกับที่ล็อกสินค้า**
+ทำให้ทั้งสองอย่าง (stock และ used_count ของคูปอง) ถูกตรวจสอบและอัปเดตแบบ atomic พร้อมกัน — ถ้า
+สินค้าหมดสต็อกกลางทาง การเพิ่ม `used_count` ของคูปองที่ทำไปแล้วก็จะถูก rollback กลับไปด้วย
+เพราะอยู่ใน transaction เดียวกันทั้งหมด (หลักการเดียวกับ 121.6 ที่ order และ stock ต้อง
+commit/rollback พร้อมกันเสมอ)
+
+ทดสอบแนวคิด (จำลอง สมมติเพิ่ม endpoint และคูปอง `SAVE10` ที่ให้ส่วนลด 10% ใช้ได้ 2 ครั้ง):
+
+```bash
+$ curl -s -X POST http://127.0.0.1:18480/orders -H "Authorization: Bearer $CUST_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"items":[{"product_id":1,"quantity":1}],"coupon_code":"SAVE10"}'
+# คาดว่า total_cents จะถูกหักส่วนลด 10% จากราคาสินค้าเดิม
+```
+
+### แนวทางเฉลยข้อ 2: ระบบรีวิวสินค้าแบบ Verified Purchase
+
+เพิ่มตารางในไฟล์ `schema.sql`:
+
+```sql
+CREATE TABLE reviews (
+    id          SERIAL PRIMARY KEY,
+    product_id  INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    rating      INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    comment     TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (product_id, user_id)  -- รีวิวสินค้าเดิมซ้ำไม่ได้ (1 คน 1 รีวิวต่อสินค้า)
+);
+
+CREATE INDEX idx_reviews_product_id ON reviews(product_id);
+```
+
+`UNIQUE (product_id, user_id)` เป็น **Composite Unique Constraint** ที่บังคับกฎ "1 คนรีวิว 1
+สินค้าได้แค่ครั้งเดียว" ให้ฐานข้อมูลจัดการเอง แทนที่จะต้อง query เช็คก่อน insert ทุกครั้ง
+(หลักการเดียวกับ `username UNIQUE` ใน Part 110)
+
+เมธอดใน `Db` ที่ตรวจสอบ "Verified Purchase" ก่อนอนุญาตให้รีวิว:
+
+```cpp
+// เพิ่มใน db.hpp
+bool has_purchased(int user_id, int product_id);
+Review create_review(int product_id, int user_id, int rating, const std::string& comment);
+std::vector<Review> list_reviews(int product_id);
+double average_rating(int product_id);
+
+// เพิ่มใน db.cpp
+bool Db::has_purchased(int user_id, int product_id) {
+    auto conn = pool_.acquire();
+    pqxx::work txn(*conn);
+    // เช็คว่ามี order_item ของสินค้านี้ ที่อยู่ใน order ของ user คนนี้หรือไม่
+    pqxx::result r = txn.exec_params(
+        "SELECT 1 FROM order_items oi "
+        "JOIN orders o ON o.id = oi.order_id "
+        "WHERE o.user_id = $1 AND oi.product_id = $2 AND o.status = 'placed' LIMIT 1;",
+        user_id, product_id
+    );
+    txn.commit();
+    return !r.empty();
+}
+
+Review Db::create_review(int product_id, int user_id, int rating, const std::string& comment) {
+    auto conn = pool_.acquire();
+    pqxx::work txn(*conn);
+    pqxx::result r = txn.exec_params(
+        "INSERT INTO reviews (product_id, user_id, rating, comment) "
+        "VALUES ($1, $2, $3, $4) RETURNING id, created_at;",
+        product_id, user_id, rating, comment
+    );
+    txn.commit();
+    Review rv;
+    rv.id = r[0]["id"].as<int>();
+    rv.product_id = product_id;
+    rv.user_id = user_id;
+    rv.rating = rating;
+    rv.comment = comment;
+    rv.created_at = r[0]["created_at"].as<std::string>();
+    return rv;
+}
+
+double Db::average_rating(int product_id) {
+    auto conn = pool_.acquire();
+    pqxx::work txn(*conn);
+    pqxx::result r = txn.exec_params(
+        "SELECT COALESCE(AVG(rating), 0) AS avg_rating FROM reviews WHERE product_id = $1;",
+        product_id
+    );
+    txn.commit();
+    return r[0]["avg_rating"].as<double>();
+}
+```
+
+Route handler ที่เชื่อมทุกอย่างเข้าด้วยกันพร้อมตรวจสอบ Verified Purchase:
+
+```cpp
+// POST /products/<id>/reviews — รีวิวสินค้า (ต้อง login และเคยซื้อสินค้านี้มาก่อนเท่านั้น)
+CROW_ROUTE(app, "/products/<int>/reviews")
+.methods(crow::HTTPMethod::POST)
+.CROW_MIDDLEWARES(app, AuthMiddleware)
+([&app, &db](const crow::request& req, int product_id) {
+    auto& ctx = app.get_context<AuthMiddleware>(req);
+
+    if (!db.has_purchased(ctx.user_id, product_id)) {
+        return api::error(403, "NOT_VERIFIED_PURCHASE",
+            "ต้องเคยสั่งซื้อสินค้านี้มาก่อนถึงจะรีวิวได้");
+    }
+
+    json body = json::parse(req.body);
+    int rating = body.value("rating", 0);
+    if (rating < 1 || rating > 5) {
+        return api::error(400, "VALIDATION_ERROR", "rating ต้องอยู่ระหว่าง 1-5");
+    }
+
+    try {
+        auto review = db.create_review(product_id, ctx.user_id, rating,
+                                        body.value("comment", ""));
+        return api::ok(review.to_json(), 201);
+    } catch (const pqxx::unique_violation&) {
+        return api::error(409, "ALREADY_REVIEWED", "คุณเคยรีวิวสินค้านี้ไปแล้ว");
+    }
+});
+```
+
+การตรวจสอบ `has_purchased()` **ก่อน** พยายาม insert เสมอ (ไม่ใช่แค่พึ่ง `UNIQUE` constraint
+อย่างเดียว) เพราะทั้งสองกฎมีความหมายต่างกัน: `UNIQUE` ป้องกัน "รีวิวซ้ำ" ส่วน
+`has_purchased()` ป้องกัน "รีวิวทั้งที่ไม่เคยซื้อ" (Verified Purchase) — ทั้งสองกฎต้องมีคู่กัน
+เพื่อความสมบูรณ์ของ business logic
+
+---
+
+## สรุปสิ่งที่ทดสอบจริง vs โค้ดอ้างอิง
+
+เพื่อความโปร่งใสทางเทคนิคอย่างที่ยึดถือมาตลอดหลักสูตรนี้ (เหมือนที่ทำใน Part 92 และ Part 112)
+ตารางนี้สรุปชัดเจนว่าส่วนไหนของ Capstone นี้ถูกรันจริงบนเครื่องที่เขียนบทเรียน และส่วนไหนเป็น
+โค้ดอ้างอิงที่ตรวจทานถูกต้องแต่ไม่มี output จาก terminal จริงมายืนยัน:
+
+| ส่วนประกอบ | สถานะ |
+|---|---|
+| Schema PostgreSQL (5 ตาราง, FK, Index, CHECK constraint) | ✅ รันจริงบน PostgreSQL 16.15 |
+| การ compile ทุกไฟล์ C++ ด้วย `g++ 13.3.0` ผ่าน CMake | ✅ Build ผ่านสะอาด ไม่มี warning (`-Wall -Wextra`) |
+| JWT sign/verify, Argon2id hash/verify | ✅ สืบทอดจาก Part 110 ที่ทดสอบไว้แล้ว + ทดสอบซ้ำใน context ใหม่นี้ |
+| Register/Login พร้อม RBAC (`customer`/`admin`) | ✅ ทดสอบจริงด้วย `curl` ครบทุก case (success, 400, 401, 409) |
+| Catalog: filter/search/pagination, N+1 avoidance | ✅ ทดสอบจริงด้วย `curl` ครบทุก query parameter |
+| Admin-only product create/update (RBAC 403/401) | ✅ ทดสอบจริงทั้ง 403 (มี token ไม่มีสิทธิ์) และ 401 (ไม่มี token) |
+| Order placement, stock decrement, transaction rollback | ✅ ทดสอบจริงทั้ง success case และ 409 INSUFFICIENT_STOCK |
+| **Concurrency test (N=30, N=50)** พิสูจน์ stock ไม่ติดลบ | ✅ **รันจริง พบบั๊กจริง แก้จริง ทดสอบซ้ำจริง** (121.7) |
+| Deadlock avoidance ด้วยการเรียงลำดับล็อก | ✅ ทดสอบจริงด้วย 40 concurrent multi-item orders |
+| Order history และ ownership check (404 ไม่ใช่ 403) | ✅ ทดสอบจริงด้วยบัญชี 2 คนที่ต่างกัน |
+| `Dockerfile` (multi-stage build) | 📄 โค้ดอ้างอิง — ไม่มี Docker daemon ในสภาพแวดล้อมนี้ |
+| `docker-compose.yml` (app + postgres) | 📄 โค้ดอ้างอิง — แต่ credential/connection string รูปแบบเดียวกันถูกพิสูจน์แล้วว่าใช้งานได้จริงผ่าน PostgreSQL แบบ native |
+
+---
+
+## สรุปท้ายบท
+
+Capstone แรกของหลักสูตรนี้พาเรากลับไปรวบรวมทักษะเกือบทั้งหมดของ Module I (Web Development)
+เข้าเป็นระบบเดียวที่ใช้งานได้จริง:
+
+- ออกแบบและสร้าง schema ฐานข้อมูลเชิงสัมพันธ์ 5 ตารางที่ normalize ถูกต้อง พร้อม Foreign Key,
+  CHECK constraint และ Index ที่เหมาะสมกับรูปแบบการ query จริง
+- จัดโครงสร้างโปรเจกต์แบบ Layered Architecture ที่ขยายจาก resource เดียว (Part 108) ไปเป็น
+  5 resource ที่สัมพันธ์กันโดยไม่สูญเสียความชัดเจนของโค้ด
+- นำ JWT Authentication และ Argon2id Password Hashing จาก Part 110 มาใช้ซ้ำได้สำเร็จ พร้อม
+  ขยายเป็นระบบ Role-Based Access Control เต็มรูปแบบ
+- แก้ปัญหา N+1 Query ด้วย `JOIN` เดียว แทนที่จะ query แยกทีละแถว
+- **ออกแบบและพิสูจน์ด้วยการทดสอบจริงว่า transaction การสั่งซื้อสินค้าปลอดภัยต่อ concurrency
+  100%** ด้วย `SELECT ... FOR UPDATE` และการเรียงลำดับล็อกป้องกัน deadlock
+- **ค้นพบและแก้บั๊ก concurrency ระดับ production จริง** (การแชร์ `pqxx::connection` ข้าม thread)
+  ด้วยการสร้าง Connection Pool ที่ thread-safe ด้วยมือ — นี่คือบทเรียนที่มีค่าที่สุดข้อหนึ่งของ
+  Part นี้ เพราะเป็นบั๊กประเภทที่ทดสอบแบบเรียกทีละ request จะไม่มีทางพบเจอเลย
+- เขียน Dockerfile แบบ Multi-stage Build และ docker-compose.yml ที่พร้อมสำหรับการ deploy จริง
+  (แม้จะไม่ได้ทดสอบรันจริงในสภาพแวดล้อมนี้)
+
+ความแตกต่างที่สำคัญที่สุดระหว่าง Capstone นี้กับแบบฝึกหัดทั่วไปในบทเรียนก่อนหน้าคือ **หัวข้อ
+121.7 ไม่ได้ถูกวางแผนไว้ล่วงหน้าว่าจะสอน — มันคือบั๊กที่เกิดขึ้นจริงระหว่างพัฒนา** การเห็น
+กระบวนการทั้งหมด (เขียนโค้ดที่ดูถูกต้อง → ทดสอบด้วย concurrent load จริง → เจอบั๊ก → วินิจฉัย
+สาเหตุ → แก้ไข → ทดสอบซ้ำเพื่อยืนยัน) คือทักษะที่สำคัญที่สุดของวิศวกรซอฟต์แวร์มืออาชีพ ยิ่งกว่า
+การเขียนโค้ดให้ถูกตั้งแต่ครั้งแรกเสียอีก เพราะในโลกจริงไม่มีใครเขียนโค้ดถูกทุกครั้งตั้งแต่แรก
+สิ่งที่แยกมืออาชีพออกจากมือใหม่คือ **กระบวนการค้นหาและแก้ปัญหาอย่างเป็นระบบ** ต่างหาก
+
+ใน **Part 122** เราจะสร้าง Capstone ที่ 2 — **Real-time Multiplayer Chat Server** ซึ่งจะพา
+ทักษะด้าน Socket Programming, Multi-threading และ WebSocket (Part 109) กลับมาใช้อีกครั้งใน
+ระดับที่ลึกกว่าเดิม พร้อมความท้าทายด้าน concurrency ชุดใหม่ที่แตกต่างจาก Capstone นี้โดยสิ้นเชิง
+— ครั้งนี้ปัญหาจะไม่ใช่ "ลด stock ให้ปลอดภัย" แต่เป็น "กระจายข้อความให้ผู้ใช้หลายพันคนพร้อมกัน
+แบบ real-time โดยไม่ให้ server ล่ม"
+
+**ต่อไป:** [Part 122 — Capstone 2: Real-time Multiplayer Chat Server](./part-122-capstone-chat-server.md)
