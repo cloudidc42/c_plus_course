@@ -184,7 +184,7 @@ Systems Programming, Data Structures & Algorithms, และการพัฒ�
 |---|---|---|
 | 113 | Clean Code และ Code Review Practice | ✅ |
 | 114 | Software Architecture สำหรับระบบใหญ่ | ✅ |
-| 115 | Security ใน C/C++ และ Secure Coding | ⏳ |
+| 115 | Security ใน C/C++ และ Secure Coding | ✅ |
 | 116 | Cross-Platform Development | ✅ |
 | 117 | ภาพรวม Embedded Systems Programming | ✅ |
 | 118 | พื้นฐาน Game Development ด้วย C++ | ✅ |
