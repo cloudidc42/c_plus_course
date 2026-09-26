@@ -307,6 +307,66 @@ function แทนเทคนิค template metaprogramming แบบเก่
 ไว้ใช้เฉพาะกรณีที่ต้องการเลือก type ที่ compile-time ซึ่ง `constexpr` function ทำไม่ได้ — จะ
 อธิบายรายละเอียดใน Part 78)
 
+### constexpr ไม่ได้จำกัดแค่ฟังก์ชันอิสระ: constexpr Constructor และ Member Function
+
+`constexpr` ยังใช้กับ **constructor** และ **member function** ของ class ได้ด้วย ทำให้เราสร้าง
+และเรียกใช้ object ทั้งชิ้นที่ compile-time ได้เลย ไม่ใช่แค่ตัวเลขเดี่ยวๆ:
+
+```cpp
+// 08_constexpr_class.cpp - constexpr constructor และ constexpr member function
+#include <iostream>
+
+class Point {
+public:
+    constexpr Point(double x, double y) : x_(x), y_(y) {}
+
+    constexpr double x() const { return x_; }
+    constexpr double y() const { return y_; }
+
+    constexpr Point translated(double dx, double dy) const {
+        return Point(x_ + dx, y_ + dy);
+    }
+
+    constexpr double distanceSquaredFromOrigin() const {
+        return x_ * x_ + y_ * y_;
+    }
+
+private:
+    double x_;
+    double y_;
+};
+
+int main() {
+    constexpr Point origin(0.0, 0.0);
+    constexpr Point p(3.0, 4.0);
+    constexpr Point moved = p.translated(1.0, 1.0);
+
+    static_assert(p.distanceSquaredFromOrigin() == 25.0, "3-4-5 triangle: 3^2 + 4^2 = 25");
+    static_assert(moved.x() == 4.0 && moved.y() == 5.0, "translated ต้องขยับพิกัดถูกต้อง");
+
+    std::cout << "origin = (" << origin.x() << ", " << origin.y() << ")\n";
+    std::cout << "p = (" << p.x() << ", " << p.y() << "), distance^2 = "
+              << p.distanceSquaredFromOrigin() << '\n';
+    std::cout << "moved = (" << moved.x() << ", " << moved.y() << ")\n";
+
+    return 0;
+}
+```
+
+```
+origin = (0, 0)
+p = (3, 4), distance^2 = 25
+moved = (4, 5)
+```
+
+สังเกตว่า `Point` ทั้งตัวถูกสร้างที่ compile-time ได้สมบูรณ์ (`constexpr Point p(3.0, 4.0);`)
+รวมถึงการเรียก member function `translated()` ที่คืน `Point` ตัวใหม่ (`moved`) ก็ยังเป็น
+compile-time evaluation ได้ต่อเนื่องเช่นกัน ตราบใดที่ทุก constructor และ member function ที่
+เกี่ยวข้องถูกประกาศเป็น `constexpr` ทั้งหมด — นี่คือรากฐานสำคัญที่ทำให้ type อย่าง `std::array`
+(ทบทวน Part 59) และ `std::pair`/`std::tuple` หลาย operation ของมันทำงานที่ compile-time ได้
+เพราะ Standard Library ออกแบบ constructor และ method จำนวนมากของ type เหล่านี้ให้เป็น
+`constexpr` ไว้ตั้งแต่ต้น
+
 ---
 
 ## 71.5 พิสูจน์การคำนวณที่ Compile-Time ด้วย static_assert (Step 565)
