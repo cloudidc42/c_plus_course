@@ -195,13 +195,11 @@ Systems Programming, Data Structures & Algorithms, และการพัฒ�
 
 | Part | หัวข้อ | สถานะ |
 |---|---|---|
-| 121 | Capstone 1: E-Commerce Backend API | ⏳ |
-| 122 | Capstone 2: Real-time Chat Server | ⏳ |
-| 123 | Capstone 3: Distributed Key-Value Store | ⏳ |
-| 124 | Capstone 4: Web Framework ของตัวเอง | ⏳ |
-| 125 | บทสรุปหลักสูตรและ Roadmap ต่อยอด | ⏳ |
-
-> **หมายเหตุ Part 115:** เนื้อหา Security/Secure Coding กำลังอยู่ระหว่างจัดทำ
+| 121 | Capstone 1: E-Commerce Backend API | ✅ |
+| 122 | Capstone 2: Real-time Chat Server | ✅ |
+| 123 | Capstone 3: Distributed Key-Value Store | ✅ |
+| 124 | Capstone 4: Web Framework ของตัวเอง | ✅ |
+| 125 | บทสรุปหลักสูตรและ Roadmap ต่อยอด | ✅ |
 
 ## โครงสร้างโฟลเดอร์
 
