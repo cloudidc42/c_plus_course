@@ -142,6 +142,28 @@ g++ -Wall -Wextra -Wpedantic -std=c++17 -pthread policy_demo.cpp -o policy_demo
 เฉพาะเมื่อมั่นใจจริงๆ ว่า operation ข้างในเป็น "pure computation" ล้วนๆ ไม่มีการจัดสรรหน่วยความจำ
 หรือเรียก mutex ใดๆ เลย (เช่น การคำนวณทางคณิตศาสตร์ล้วนๆ)
 
+### STL Algorithm ตัวไหนบ้างที่รับ Execution Policy ได้
+
+C++17 เพิ่ม overload ที่รับ execution policy ให้กับ algorithm ส่วนใหญ่ใน `<algorithm>` และ
+`<numeric>` ตารางด้านล่างสรุป algorithm ที่ใช้บ่อยที่สุดที่รองรับ (ไม่ใช่รายการทั้งหมด — ใน
+มาตรฐานมีมากกว่า 69 ตัว):
+
+| หมวดหมู่ | ตัวอย่าง Algorithm |
+|---|---|
+| การเรียงลำดับ | `sort`, `stable_sort`, `partial_sort`, `nth_element` |
+| การแปลงข้อมูล | `transform`, `for_each`, `replace`, `replace_if`, `fill` |
+| การค้นหา | `find`, `find_if`, `count`, `count_if`, `all_of`, `any_of`, `none_of` |
+| การรวมค่า (เพิ่มใหม่คู่กับ policy) | `reduce`, `transform_reduce`, `exclusive_scan`, `inclusive_scan` |
+| การคัดลอก/ย้าย | `copy`, `copy_if`, `move`, `remove`, `remove_if`, `unique` |
+| การเปรียบเทียบ | `equal`, `mismatch`, `lexicographical_compare` |
+
+สังเกตว่า `std::accumulate` (ตัวเก่าจาก C++98) **ไม่มี** overload ที่รับ execution policy
+เพราะ `accumulate` ถูกออกแบบมาให้รับประกัน**ลำดับการคำนวณจากซ้ายไปขวาเป๊ะ** (สำคัญสำหรับ
+operation ที่ไม่ commutative เช่นการต่อ string) ซึ่งขัดแย้งโดยธรรมชาติกับแนวคิดการขนานงาน
+— นี่คือเหตุผลที่ C++17 ต้องเพิ่ม `std::reduce` เป็นฟังก์ชันใหม่แยกต่างหาก (มีพฤติกรรมคล้าย
+`accumulate` แต่ **ไม่รับประกันลำดับการคำนวณ** เพื่อให้ library มีอิสระในการขนานงานได้เต็มที่)
+แทนที่จะเพิ่ม policy overload ให้ `accumulate` ตรงๆ
+
 ---
 
 ## 85.3 การเปลี่ยน std::sort ให้ทำงานแบบขนาน (Step 675)
