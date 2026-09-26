@@ -1065,6 +1065,51 @@ HTTP/1.1 400 Bad Request
 {"error":{"code":"VALIDATION_ERROR","message":"ฟิลด์ \"done\" ต้องเป็น boolean (true/false)"},"success":false}
 ```
 
+**ทดสอบ 9 — ทดสอบขอบเขตความยาว (boundary test) และฟิลด์ที่ไม่รู้จัก:**
+
+การ validate ความยาว `title` ว่า "1-200 ตัวอักษร" ต้องทดสอบที่ **ขอบเขต** เสมอ ไม่ใช่แค่กรณี
+ปกติ — ทดสอบด้วย title ยาวพอดี 200 ตัวอักษร (ต้องผ่าน) และ 201 ตัวอักษร (ต้องไม่ผ่าน):
+
+```bash
+$ TITLE_200=$(python3 -c "print('a'*200)")
+$ curl -s -i -X POST http://127.0.0.1:18180/tasks -d "{\"title\":\"$TITLE_200\"}"
+HTTP/1.1 201 Created
+...
+(สร้างสำเร็จ เพราะ 200 ตัวอักษรอยู่ในขอบเขตที่อนุญาตพอดี)
+
+$ TITLE_201=$(python3 -c "print('a'*201)")
+$ curl -s -i -X POST http://127.0.0.1:18180/tasks -d "{\"title\":\"$TITLE_201\"}"
+HTTP/1.1 400 Bad Request
+...
+{"error":{"code":"VALIDATION_ERROR","message":"ฟิลด์ \"title\" ต้องมีความยาว 1-200 ตัวอักษร"},"success":false}
+```
+
+การทดสอบแบบนี้เรียกว่า **Boundary Value Testing** — บั๊กจำนวนมากในโลกจริงเป็น
+**Off-by-One Error** (เขียน `<` แทนที่จะเป็น `<=` หรือกลับกัน) ซึ่งจะไม่มีวันถูกจับได้ถ้า
+ทดสอบแค่ค่ากลางๆ อย่าง title ยาว 10 ตัวอักษรเท่านั้น
+
+ทดสอบส่ง field ที่ไม่รู้จักเข้ามาปนด้วย (`extra_field`) — โค้ด validation ของเราตรวจสอบเฉพาะ
+field ที่รู้จัก (`title`, `description`, `done`) และ **เพิกเฉย** field แปลกปลอมโดยไม่ error:
+
+```bash
+$ curl -s -i -X POST http://127.0.0.1:18180/tasks -d '{"title":"ok","extra_field":"ignored?"}'
+HTTP/1.1 201 Created
+...
+{"data":{"created_at":"2026-09-26 09:28:48","description":"","done":false,"id":2,"title":"ok"},"success":true}
+```
+
+`extra_field` ถูกละเลยไปเงียบๆ ไม่ถูกบันทึกและไม่ทำให้ request ล้มเหลว นี่คือการตัดสินใจ
+ออกแบบอย่างหนึ่ง (เรียกว่า **Lenient/Permissive Validation**) ซึ่งมีทั้งข้อดีและข้อเสีย:
+
+| แนวทาง | ข้อดี | ข้อเสีย |
+|---|---|---|
+| **Permissive** (เพิกเฉย field แปลกปลอม — ที่ใช้ในบทนี้) | Client เก่าที่ส่ง field เกินมาไม่พัง เมื่อ API เพิ่ม field ใหม่ในอนาคต | พิมพ์ชื่อ field ผิด (เช่น `"tittle"` แทน `"title"`) จะไม่มีการเตือนเลย ทำให้ debug ยาก |
+| **Strict** (ปฏิเสธถ้ามี field ที่ไม่รู้จัก) | จับ typo ของ client ได้ทันที | ต้องอัปเดต client ทุกตัวพร้อมกันทุกครั้งที่ API เปลี่ยน schema แม้เพิ่ม field ใหม่ที่ไม่บังคับ |
+
+บทเรียนนี้เลือก Permissive เพราะเป็นแนวทางที่ REST API สาธารณะส่วนใหญ่ในโลกจริงใช้ (เช่น
+Stripe API, GitHub API) แต่ผู้เรียนควรรู้ว่านี่คือทางเลือกที่ต้องตัดสินใจเอง ไม่ใช่ค่า default
+ที่ถูกต้องเสมอไป
+
 ทั้งหมดนี้คือผลลัพธ์จริงที่รันได้บนเครื่องจริง (g++ 13.3.0, Crow master, SQLite 3.45.1) —
 ทุก endpoint, ทุก status code, และทุก error case ทำงานตรงตามที่ออกแบบไว้ในหัวข้อ 108.1
 และ 108.2 ทุกประการ
