@@ -445,6 +445,51 @@ response) `await_ready()` จะคืน `false` และ `await_suspend()` �
 ไว้เรียก `.resume()` ในภายหลัง เมื่อข้อมูลจริงพร้อมแล้ว (เช่น จาก callback ของ OS หรือ
 event loop) — นี่คือกลไกที่ทำให้ "async I/O" เป็นไปได้ ซึ่งจะพูดถึงเพิ่มใน 75.7
 
+### ค่าที่ await_suspend คืนได้: void, bool, และ coroutine_handle<> อื่น
+
+`await_suspend()` ไม่จำเป็นต้องคืน `void` เสมอไปตามที่เห็นใน `std::suspend_always` มาตรฐาน
+อนุญาตให้คืนได้ 3 แบบ ซึ่งแต่ละแบบมีความหมายต่างกัน:
+
+| Return Type | ความหมาย |
+|---|---|
+| `void` | suspend แน่นอน ไม่มีทางยกเลิก |
+| `bool` | คืน `true` = suspend จริง / คืน `false` = **ยกเลิกการ suspend** ทำงานต่อทันที |
+| `std::coroutine_handle<>` (ตัวอื่น) | suspend ตัวเอง แล้ว**เรียก resume ของ coroutine อีกตัวที่คืนมาต่อทันที** (เทคนิคนี้เรียกว่า **symmetric transfer** ใช้ทำ scheduler ที่ส่งต่องานกันหลายชั้นโดยไม่ทำให้ stack ลึกขึ้นเรื่อยๆ ทีละชั้น) |
+
+ลองดูตัวอย่างแบบ `bool` ที่ทดสอบคอมไพล์และรันจริงแล้ว:
+
+```cpp
+// Awaiter ที่ await_suspend คืน bool: true = suspend จริง, false = ทำงานต่อทันที
+struct ConditionalAwait {
+    bool should_suspend;
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<>) const noexcept {
+        std::cout << "[await_suspend called] ";
+        return should_suspend;   // false -> ยกเลิก suspend ทำงานต่อทันที
+    }
+    void await_resume() const noexcept {}
+};
+
+Task demo() {
+    std::cout << "before\n";
+    co_await ConditionalAwait{false};   // false -> ไม่ suspend จริง ทำงานต่อทันที
+    std::cout << "after\n";
+}
+```
+
+ทดสอบจริงได้ผลลัพธ์:
+
+```
+before
+[await_suspend called] after
+```
+
+สังเกตว่า `await_suspend()` **ถูกเรียกจริง** (เพราะ `await_ready()` คืน `false`) แต่เพราะ
+มันคืน `false` กลับมา coroutine เลย**ไม่ suspend จริง** ทำงานต่อจนจบทันทีในการเรียกครั้งแรก
+โดยไม่ต้องมีใครมาเรียก `.resume()` เพิ่ม — เทคนิคนี้มีประโยชน์เมื่ออยากเช็คเงื่อนไขบางอย่าง
+ก่อนตัดสินใจว่าจะ suspend จริงหรือไม่ (เช่น เช็คว่าข้อมูลพร้อมอยู่แล้วหรือยัง ถ้าพร้อมแล้ว
+ก็ไม่จำเป็นต้อง suspend ให้เสียเวลา)
+
 ---
 
 ## 75.6 ทำไม C++20 Coroutine เป็นแค่ "Low-Level Building Block" (Step 598)

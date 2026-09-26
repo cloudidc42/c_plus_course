@@ -356,14 +356,35 @@ int main() {
 `typename ...::type` และ `...::value` ออกได้ ทำให้อ่านง่ายขึ้นมาก:
 
 ```cpp
-// แบบเก่า (C++11)
-typename std::remove_reference<T>::type
-std::is_integral<T>::value
+#include <type_traits>
 
-// แบบใหม่ (C++14+) — สั้นและอ่านง่ายกว่ามาก
-std::remove_reference_t<T>
-std::is_integral_v<T>
+template <typename T>
+void demo() {
+    // แบบเก่า (C++11)
+    using OldStyle = typename std::remove_reference<T>::type;
+    constexpr bool old_check = std::is_integral<T>::value;
+
+    // แบบใหม่ (C++14+) — สั้นและอ่านง่ายกว่ามาก
+    using NewStyle = std::remove_reference_t<T>;
+    constexpr bool new_check = std::is_integral_v<T>;
+
+    static_assert(std::is_same_v<OldStyle, NewStyle>, "ทั้งสองแบบต้องได้ชนิดเดียวกัน");
+    static_assert(old_check == new_check, "ทั้งสองแบบต้องได้ค่าเดียวกัน");
+}
+
+int main() {
+    demo<int&>();
+    return 0;
+}
 ```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++20 alias_vs_full.cpp -o alias_vs_full && ./alias_vs_full
+```
+
+โปรแกรมนี้ไม่พิมพ์อะไรออกมาเลย (คอมไพล์ผ่านและรันจบเงียบๆ) เพราะจุดประสงค์คือให้ `static_assert`
+ยืนยันที่ compile time ว่ารูปแบบเต็ม (`typename ...::type`, `...::value`) กับรูปแบบย่อ (`_t`, `_v`)
+ให้ผลลัพธ์เหมือนกันทุกประการ — ถ้าไม่ตรงกัน โปรแกรมจะคอมไพล์ไม่ผ่านทันที
 
 โค้ดจริงในปี 2026 แทบจะใช้แต่รูปแบบ `_v` และ `_t` เท่านั้น แต่บทความ/ไลบรารีเก่าจำนวนมากยังใช้
 รูปแบบเต็ม ผู้เรียนจึงต้องอ่านทั้งสองแบบให้ออก

@@ -430,6 +430,26 @@ leak_test.cpp:3:17: error: 'square' was not declared in this scope
 | **Header Unit** (`import <header>;` การ import header เดิมแบบ module) | ตามมาตรฐานมีแนวคิดนี้อยู่ แต่ต้อง precompile header เป็น BMI ก่อนใช้งานเช่นกัน (ทดสอบบนเครื่องนี้พบว่ายังต้องตั้งค่าเพิ่มเติมพอสมควร ดู 76.7) |
 | **Binary Compatibility ของ BMI ข้ามคอมไพเลอร์/เวอร์ชัน** | ไม่มีมาตรฐานกลาง — ไฟล์ `.gcm` ของ GCC ใช้กับ Clang ไม่ได้ และบางครั้งก็ใช้ข้าม GCC คนละเวอร์ชันไม่ได้ด้วยซ้ำ ทำให้การแจกจ่ายไลบรารีเป็น "precompiled module" ข้าม toolchain แทบเป็นไปไม่ได้ในทางปฏิบัติ ต่างจาก header ที่เป็น text ธรรมดาที่คอมไพล์ได้ทุกที่เสมอ |
 
+ทดสอบยืนยันประเด็น `import std;` โดยตรงบนเครื่องนี้ (ทั้ง `-std=c++20` และ `-std=c++23`):
+
+```cpp
+import std;
+int main() { std::cout << "test\n"; }
+```
+
+```
+In module imported at import_std_test.cpp:1:1:
+std: error: failed to read compiled module: No such file or directory
+std: note: compiled module file is 'gcm.cache/std.gcm'
+std: note: imports must be built before being imported
+```
+
+ผลลัพธ์เดียวกันทั้งสองมาตรฐาน — เพราะ GCC 13.3.0 ไม่ได้แจก standard library ในรูปแบบ module
+สำเร็จรูป (precompiled `std.gcm`) มาให้ใช้ทันที ผู้ใช้ต้อง build module `std` เองจาก source
+ของ libstdc++ ก่อน (ซึ่งซับซ้อนและอยู่นอกเหนือขอบเขตของบทเรียนนี้) ยืนยันชัดเจนว่า
+`import std;` ยังไม่ใช่ทางเลือกที่ใช้งานได้ทันทีบน toolchain นี้ ต่างจากที่บางบทความออนไลน์
+อาจพูดถึงในเชิงทฤษฎีล้วนๆ
+
 **สรุปตรงไปตรงมา**: ในโปรเจกต์ open-source และองค์กรขนาดใหญ่จำนวนมาก ณ ปี 2026 **ยังคง
 ใช้ header file (`#include`) เป็นวิธีหลักในการจัดโครงสร้างโค้ด** เหตุผลหลักไม่ใช่เพราะ
 module แย่ในทางทฤษฎี (ตรงกันข้าม มันแก้ปัญหาที่แท้จริงตามที่อธิบายใน 76.1–76.2) แต่เป็น
@@ -546,6 +566,42 @@ module แย่ในทางทฤษฎี (ตรงกันข้าม �
 | โปรเจกต์เก่าขนาดใหญ่ที่มีโค้ดหลักล้านบรรทัด | ไม่คุ้มที่จะ migrate ทั้งหมด อาจพิจารณาใช้ module เฉพาะโค้ดใหม่ที่เขียนเพิ่มเข้าไปเท่านั้น |
 | ไลบรารีที่ต้องแจกจ่ายให้คนอื่นใช้ผ่านหลาย toolchain | แจกเป็น header ตามเดิม เพราะ BMI ไม่ compatible ข้ามคอมไพเลอร์ |
 | งานเรียนรู้/ทดลองเพื่อเข้าใจอนาคตของภาษา | คุ้มค่ามากที่จะเรียนรู้ไว้ เพราะ module คือทิศทางระยะยาวของ C++ อย่างชัดเจน |
+
+### ใช้ Makefile บังคับลำดับการ build module ให้ถูกต้อง (ทบทวนจาก Part 18)
+
+ทบทวนจาก **Part 18**: เราใช้ `make` เพื่อจัดการลำดับการ build ผ่านการประกาศ dependency
+ระหว่างไฟล์ หลักการเดียวกันนี้ใช้แก้ปัญหา "ต้อง build module ก่อนไฟล์ที่ import" ได้พอดี
+ทดสอบแล้วว่า Makefile นี้ทำงานถูกต้องบนเครื่องนี้:
+
+```makefile
+CXX = g++
+CXXFLAGS = -std=c++20 -fmodules-ts -Wall -Wextra
+
+main: main.o numeric.o
+	$(CXX) $(CXXFLAGS) numeric.o main.o -o main
+
+# กฎสำคัญ: ไฟล์ที่ import module ต้องขึ้นกับไฟล์ .o ของ module นั้นเสมอ
+# เพื่อบังคับให้ make คอมไพล์ module ให้เสร็จก่อนเสมอ ไม่ว่าจะสั่ง make จากลำดับไหน
+main.o: main.cpp numeric.o
+	$(CXX) $(CXXFLAGS) -c main.cpp -o main.o
+
+numeric.o: numeric.cc
+	$(CXX) $(CXXFLAGS) -c numeric.cc -o numeric.o
+
+clean:
+	rm -f *.o main
+	rm -rf gcm.cache
+```
+
+```bash
+make
+./main
+```
+
+ทดสอบจริง `make` เรียกคำสั่งตามลำดับที่ถูกต้องให้อัตโนมัติ (`numeric.cc` ก่อน `main.cpp`
+เสมอ เพราะประกาศ dependency ไว้) และรันได้ผลลัพธ์ถูกต้องครบถ้วน — วิธีนี้ปลอดภัยกว่าการจำ
+ลำดับคำสั่งด้วยตัวเองมาก และเป็นแนวทางเบื้องต้นก่อนจะขยับไปใช้ build system ที่รองรับ
+module โดยเฉพาะอย่าง CMake รุ่นใหม่ (Part 91) เมื่อโปรเจกต์ใหญ่ขึ้น
 
 module คือ**อนาคต**ของการจัดการโค้ด C++ อย่างไม่ต้องสงสัย เพราะแก้ปัญหาเชิงโครงสร้างที่
 `#include` มีมาตั้งแต่ยุค C แรกเริ่มได้จริงในระดับภาษา แต่ ณ ปี 2026 มันยังอยู่ในช่วง

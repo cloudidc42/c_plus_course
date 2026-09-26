@@ -759,55 +759,6 @@ t1 >= t2: false
 `double` เพียงตัวเดียว) ส่วนอีก 4 operator ที่เหลือได้มาฟรีจาก `Comparable<Temperature>` — โครงสร้าง
 เดียวกับตัวอย่าง `Money` ใน 79.4 ทุกประการ เพียงเปลี่ยนชนิดข้อมูลภายในจาก `long` เป็น `double`
 
-### แนวทางเฉลยข้อ 4
-
-```cpp
-#include <iostream>
-#include <type_traits>
-
-template <typename Derived>
-class SafeBase {
-public:
-    SafeBase() {
-        static_assert(std::is_base_of_v<SafeBase<Derived>, Derived>,
-                      "Derived ต้องสืบทอดจาก SafeBase<Derived> เท่านั้น "
-                      "(CRTP ต้องใช้ตัวเองเป็น Template Argument)");
-    }
-    void interface() { static_cast<Derived*>(this)->implementation(); }
-};
-
-class WrongUsage : public SafeBase<int> {  // ผิดโดยตั้งใจ เพื่อทดสอบ static_assert
-public:
-    void implementation() {}
-};
-
-int main() {
-    WrongUsage w;
-    w.interface();
-    return 0;
-}
-```
-
-```bash
-g++ -Wall -Wextra -Wpedantic -std=c++20 ex4.cpp -o ex4
-```
-
-Error message จริงที่ได้ (แสดงเฉพาะส่วนบนสุด — ส่วนสำคัญที่สุด):
-
-```
-ex4.cpp: In instantiation of 'SafeBase<Derived>::SafeBase() [with Derived = int]':
-ex4.cpp:14:7:   required from here
-ex4.cpp:8:28: error: static assertion failed: Derived ต้องสืบทอดจาก SafeBase<Derived> เท่านั้น
-(CRTP ต้องใช้ตัวเองเป็น Template Argument)
-ex4.cpp:8:28: note: 'std::is_base_of_v<SafeBase<int>, int>' evaluates to false
-```
-
-**อธิบาย**: เทียบกับ Error ดิบใน 79.6 ที่พูดแค่ `invalid 'static_cast' from type 'Base<int>*' to
-type 'int*'` (ต้องอนุมานเอาเองว่าปัญหาคืออะไร) ข้อความจาก `static_assert` นี้บอก**ตรงๆ เป็น
-ภาษาที่มนุษย์เขียนเอง** ว่าปัญหาคืออะไรและควรแก้อย่างไร พร้อม `note` ที่ยืนยันด้วยว่าเงื่อนไข
-`is_base_of_v<SafeBase<int>, int>` เป็น `false` จริง — นี่คือคุณค่าที่แท้จริงของการเติม Guard
-Clause แบบนี้ไว้ใน CRTP Base Class ทุกตัวที่จะให้คนอื่นในทีมนำไปใช้ต่อ
-
 ### แนวทางเฉลยข้อ 3
 
 ```cpp
@@ -859,6 +810,55 @@ g++ -Wall -Wextra -Wpedantic -std=c++20 ex3.cpp -o ex3 && ./ex3
 ของ `Derived` (ที่ compiler สร้างให้อัตโนมัติตาม Rule of Zero เพราะ `Document` มีแค่ `std::string`
 เป็น member) การแก้ไข `copy` (เปลี่ยนชื่อเรื่อง) ไม่กระทบ `original` เลย เพราะเป็นการ Deep Copy
 ผ่าน `std::string` ที่จัดการ memory ให้เองอย่างปลอดภัย
+
+### แนวทางเฉลยข้อ 4
+
+```cpp
+#include <iostream>
+#include <type_traits>
+
+template <typename Derived>
+class SafeBase {
+public:
+    SafeBase() {
+        static_assert(std::is_base_of_v<SafeBase<Derived>, Derived>,
+                      "Derived ต้องสืบทอดจาก SafeBase<Derived> เท่านั้น "
+                      "(CRTP ต้องใช้ตัวเองเป็น Template Argument)");
+    }
+    void interface() { static_cast<Derived*>(this)->implementation(); }
+};
+
+class WrongUsage : public SafeBase<int> {  // ผิดโดยตั้งใจ เพื่อทดสอบ static_assert
+public:
+    void implementation() {}
+};
+
+int main() {
+    WrongUsage w;
+    w.interface();
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++20 ex4.cpp -o ex4
+```
+
+Error message จริงที่ได้ (แสดงเฉพาะส่วนบนสุด — ส่วนสำคัญที่สุด):
+
+```
+ex4.cpp: In instantiation of 'SafeBase<Derived>::SafeBase() [with Derived = int]':
+ex4.cpp:14:7:   required from here
+ex4.cpp:8:28: error: static assertion failed: Derived ต้องสืบทอดจาก SafeBase<Derived> เท่านั้น
+(CRTP ต้องใช้ตัวเองเป็น Template Argument)
+ex4.cpp:8:28: note: 'std::is_base_of_v<SafeBase<int>, int>' evaluates to false
+```
+
+**อธิบาย**: เทียบกับ Error ดิบใน 79.6 ที่พูดแค่ `invalid 'static_cast' from type 'Base<int>*' to
+type 'int*'` (ต้องอนุมานเอาเองว่าปัญหาคืออะไร) ข้อความจาก `static_assert` นี้บอก**ตรงๆ เป็น
+ภาษาที่มนุษย์เขียนเอง** ว่าปัญหาคืออะไรและควรแก้อย่างไร พร้อม `note` ที่ยืนยันด้วยว่าเงื่อนไข
+`is_base_of_v<SafeBase<int>, int>` เป็น `false` จริง — นี่คือคุณค่าที่แท้จริงของการเติม Guard
+Clause แบบนี้ไว้ใน CRTP Base Class ทุกตัวที่จะให้คนอื่นในทีมนำไปใช้ต่อ
 
 ---
 

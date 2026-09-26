@@ -149,14 +149,35 @@ Part ที่เกี่ยวข้องในหลักสูตรนี
 **1. Prefer Smart Pointer over Raw Pointer + `new`/`delete`** (Part 67)
 
 ```cpp
+#include <memory>
+
+struct Widget {
+    int value = 0;
+};
+
 // ไม่แนะนำ
-Widget* w = new Widget();
-// ... ใช้งาน w ...
-delete w;  // ลืมบรรทัดนี้ = memory leak ทันที
+void not_recommended() {
+    Widget* w = new Widget();
+    // ... ใช้งาน w ...
+    delete w;  // ลืมบรรทัดนี้ = memory leak ทันที
+}
 
 // แนะนำ
-auto w = std::make_unique<Widget>();
-// ไม่ต้อง delete เอง ปลอดภัยแม้เกิด exception ระหว่างทาง
+void recommended() {
+    auto w = std::make_unique<Widget>();
+    // ไม่ต้อง delete เอง ปลอดภัยแม้เกิด exception ระหว่างทาง
+    (void)w;
+}
+
+int main() {
+    not_recommended();
+    recommended();
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++20 prefer_smart_pointer.cpp -o prefer_smart_pointer
 ```
 
 **2. Prefer RAII over Manual Cleanup** (Part 68) — ผูกทรัพยากรทุกชนิด (ไม่ใช่แค่ memory) เข้ากับ
@@ -225,6 +246,79 @@ Signature ให้ตรงกับ Base Class จริง ป้องกั
 48, Part 50) — Inheritance ควรใช้เมื่อมีความสัมพันธ์แบบ "เป็นชนิดย่อยของ" ที่แท้จริงเท่านั้น
 (Liskov Substitution) การ "อยากใช้โค้ดร่วมกัน" เฉยๆ ควรใช้ Composition (มี object เป็น member)
 หรือ CRTP Mixin (Part 79) แทน
+
+### ตัวอย่างรวม: เห็นหลายข้อพร้อมกันในโค้ดเดียว
+
+เพื่อให้เห็นภาพว่าข้อ 3, 5, 7, 8, 11 ทำงานร่วมกันในโค้ดจริงได้อย่างไร ลองดูโปรแกรมสั้นๆ ที่รวม
+หลักการเหล่านี้ไว้ในที่เดียว:
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <iostream>
+#include <memory>
+#include <numeric>
+#include <vector>
+
+struct Widget {
+    int id;
+    void greet() const { std::cout << "Widget #" << id << "\n"; }
+};
+
+int main() {
+    // ข้อ 1: smart pointer แทน raw pointer + new/delete
+    auto w = std::make_unique<Widget>(Widget{1});
+    w->greet();
+
+    // ข้อ 8: range-based for แทน index-based loop
+    std::vector<int> numbers{1, 2, 3, 4, 5};
+    int sum = 0;
+    for (const int n : numbers) {
+        sum += n;
+    }
+    std::cout << "sum (range-based for) = " << sum << "\n";
+
+    // ข้อ 7: auto เมื่อชนิดข้อมูลยาวหรือชัดเจนจาก RHS อยู่แล้ว
+    auto it = std::find(numbers.begin(), numbers.end(), 3);
+    if (it != numbers.end()) {
+        std::cout << "พบเลข 3 ที่ตำแหน่ง " << std::distance(numbers.begin(), it) << "\n";
+    }
+
+    // ข้อ 3: std::array แทน C array แบบ fixed-size
+    std::array<int, 3> fixed{10, 20, 30};
+    std::cout << "fixed.size() = " << fixed.size() << "\n";
+
+    // ข้อ 11: STL algorithm แทนการเขียน loop เอง
+    const int total = std::accumulate(numbers.begin(), numbers.end(), 0);
+    std::cout << "total (accumulate) = " << total << "\n";
+
+    // ข้อ 5: nullptr แทน NULL / 0
+    Widget* maybe = nullptr;
+    std::cout << "maybe == nullptr: " << std::boolalpha << (maybe == nullptr) << "\n";
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++20 prefer_examples.cpp -o prefer_examples
+./prefer_examples
+```
+
+ผลลัพธ์:
+
+```
+Widget #1
+sum (range-based for) = 15
+พบเลข 3 ที่ตำแหน่ง 2
+fixed.size() = 3
+total (accumulate) = 15
+maybe == nullptr: true
+```
+
+สังเกตว่าโค้ดทั้งหมดนี้ **ไม่มี `new`/`delete` แม้แต่บรรทัดเดียว ไม่มี Index-based Loop ที่ไม่จำเป็น
+ไม่มี C-style Array ไม่มี `NULL`** — นี่คือสิ่งที่ "โค้ด C++ สมัยใหม่" ที่ดีหน้าตาเป็นแบบนี้จริงๆ
+ในการทำงานประจำวัน ไม่ใช่แค่ตัวอย่างในหนังสือ
 
 ---
 
@@ -327,6 +421,41 @@ private:
     int size_;
     int capacity_;
 };
+
+int main() {
+    NameListOld list;
+    list.add("Somchai");
+    list.add("Suda");
+    list.add("Anan");
+
+    NameListOld copy = list;
+    copy.add("Malee");
+
+    std::cout << "list ต้นฉบับ:\n";
+    list.print_all();
+    std::cout << "copy (มีเพิ่ม Malee):\n";
+    copy.print_all();
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++20 name_list_old.cpp -o name_list_old && ./name_list_old
+```
+
+ผลลัพธ์:
+
+```
+list ต้นฉบับ:
+- Somchai
+- Suda
+- Anan
+copy (มีเพิ่ม Malee):
+- Somchai
+- Suda
+- Anan
+- Malee
 ```
 
 โค้ดนี้**คอมไพล์ผ่านโดยไม่มี Warning** และ**ทำงานถูกต้อง** แต่มีปัญหาเชิงคุณภาพมหาศาลซ่อนอยู่:
@@ -516,6 +645,133 @@ Checklist นี้ไม่ใช่กฎตายตัวที่ต้อ�
 6. อธิบาย (เป็นข้อความหรือ comment ในโค้ด) ว่าทำไม C++ Core Guidelines ถึงแนะนำ "Prefer Composition
    over Inheritance" ทั้งที่ Inheritance เป็นฟีเจอร์หลักของ OOP ที่เราเรียนมาตั้งแต่ Part 48
    ยกตัวอย่างสถานการณ์ที่ใช้ Inheritance ผิดที่มาประกอบคำอธิบาย
+
+### แนวทางเฉลยข้อ 1
+
+```cpp
+#include <cstring>
+#include <iostream>
+#include <string>
+#include <vector>
+
+// ---------- สไตล์เก่า: เพิ่ม remove_last() ----------
+class NameListOld {
+public:
+    NameListOld() : names_(nullptr), size_(0), capacity_(0) {}
+
+    ~NameListOld() {
+        for (int i = 0; i < size_; ++i) {
+            delete[] names_[i];
+        }
+        delete[] names_;
+    }
+
+    void add(const char* name) {
+        if (size_ == capacity_) {
+            grow();
+        }
+        names_[size_] = new char[std::strlen(name) + 1];
+        std::strcpy(names_[size_], name);
+        size_++;
+    }
+
+    void remove_last() {
+        if (size_ == 0) {
+            return;  // ต้องเช็คเอง ไม่งั้น underflow
+        }
+        size_--;
+        delete[] names_[size_];  // ต้องจำ free เอง ไม่งั้น leak
+        names_[size_] = nullptr;
+    }
+
+    void print_all() const {
+        for (int i = 0; i < size_; i++) {
+            std::cout << "- " << names_[i] << "\n";
+        }
+    }
+
+private:
+    void grow() {
+        int new_capacity = (capacity_ == 0) ? 4 : capacity_ * 2;
+        char** new_names = new char*[new_capacity];
+        for (int i = 0; i < size_; i++) {
+            new_names[i] = names_[i];
+        }
+        delete[] names_;
+        names_ = new_names;
+        capacity_ = new_capacity;
+    }
+
+    char** names_;
+    int size_;
+    int capacity_;
+};
+
+// ---------- สไตล์ใหม่: เพิ่ม remove_last() ----------
+class NameList {
+public:
+    void add(const std::string& name) { names_.push_back(name); }
+
+    void remove_last() {
+        if (!names_.empty()) {
+            names_.pop_back();  // vector จัดการ memory ให้เองทั้งหมด
+        }
+    }
+
+    void print_all() const {
+        for (const auto& name : names_) {
+            std::cout << "- " << name << "\n";
+        }
+    }
+
+private:
+    std::vector<std::string> names_;
+};
+
+int main() {
+    NameListOld old_list;
+    old_list.add("A");
+    old_list.add("B");
+    old_list.add("C");
+    old_list.remove_last();
+    std::cout << "NameListOld หลัง remove_last():\n";
+    old_list.print_all();
+
+    NameList new_list;
+    new_list.add("A");
+    new_list.add("B");
+    new_list.add("C");
+    new_list.remove_last();
+    std::cout << "NameList หลัง remove_last():\n";
+    new_list.print_all();
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++20 ex1.cpp -o ex1 && ./ex1
+```
+
+ผลลัพธ์:
+
+```
+NameListOld หลัง remove_last():
+- A
+- B
+NameList หลัง remove_last():
+- A
+- B
+```
+
+**อธิบาย**: ใน `NameListOld` ฟังก์ชัน `remove_last()` ต้อง **จำเรื่อง memory management เองสองเรื่อง
+พร้อมกัน**: (1) เช็คไม่ให้ `size_` ติดลบ (2) เรียก `delete[]` คืนหน่วยความจำของ string ตัวสุดท้าย
+ก่อนลด `size_` ลง ถ้าลืมข้อใดข้อหนึ่งจะเกิด Memory Leak หรือ Undefined Behavior ทันที ในขณะที่
+`NameList::remove_last()` ใช้ `names_.pop_back()` เพียงบรรทัดเดียว — `std::vector<std::string>`
+จัดการทั้งการคืน memory ของ `std::string` ตัวสุดท้ายและการลดขนาดให้ทั้งหมดโดยอัตโนมัติ ไม่มีทางลืม
+ขั้นตอนใดขั้นตอนหนึ่งได้เลย นี่คือตัวอย่างที่ชัดเจนว่าทำไม Rule of Zero (80.2) ถึงไม่ได้แค่ลดจำนวน
+บรรทัดตอนเขียน constructor/destructor เท่านั้น แต่ยังลดความเสี่ยงบั๊กในทุกฟังก์ชันที่เพิ่มเข้ามาใน
+อนาคตด้วย
 
 ### แนวทางเฉลยข้อ 2
 
