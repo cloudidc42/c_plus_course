@@ -203,6 +203,36 @@ CPU ตระกูล ARM Cortex-M เมื่อเปิดเครื่�
 เขียนเอง — บน bare-metal เราต้องรู้ **memory map ที่แท้จริงของฮาร์ดแวร์เป้าหมาย** และเขียน
 Linker Script เองเสมอ
 
+### ภาพรวม Memory Map ของบอร์ด LM3S6965 ที่จะใช้ในหัวข้อถัดไป
+
+```
+Flash (0x00000000 - 0x0003FFFF, 256 KB)      RAM (0x20000000 - 0x2000FFFF, 64 KB)
+┌─────────────────────────────────┐         ┌──────────────────────────────┐
+│ 0x00000000  .isr_vector          │         │ 0x20000000  .data (สำเนาที่   │
+│             (Stack Ptr, Reset,   │  copy   │             ถูก copy มาจาก    │
+│             NMI, Hard Fault, ...)│ ──────► │             Fl. ตอนบูท)      │
+├─────────────────────────────────┤         ├──────────────────────────────┤
+│             .text                │         │             .bss (เคลียร์      │
+│             (โค้ดโปรแกรม +        │         │             เป็น 0 ตอนบูท)     │
+│             .rodata)             │         ├──────────────────────────────┤
+│                                   │         │             heap/stack       │
+│                                   │         │             (ถ้ามีการใช้)      │
+└─────────────────────────────────┘         │                    ▲          │
+                                              │                    │ stack   │
+                                              │             0x2000FFFF       │
+                                              │             (_estack, จุดเริ่ม│
+                                              │             ของ stack ที่โต   │
+                                              │             ลงมาหา address    │
+                                              │             ต่ำ)              │
+                                              └──────────────────────────────┘
+```
+
+แผนภาพนี้สรุปสิ่งที่ `linker.ld` ในหัวข้อ 117.5 กำหนดไว้ทั้งหมด: CPU เริ่มอ่านจาก
+`0x00000000` (Flash) เสมอตอน Reset, โค้ดที่รันจริง (`.text`) อยู่ใน Flash ตลอดเวลา (ไม่ถูก
+copy ไปไหน เพราะ CPU รันโค้ดจาก Flash ได้โดยตรง), ส่วนข้อมูลที่ต้องแก้ไขได้ระหว่างรัน
+(`.data`, `.bss`) ต้องอยู่ใน RAM เท่านั้น และ stack เริ่มจากปลายบนสุดของ RAM โตลงมาหา
+address ต่ำกว่าตามธรรมเนียมมาตรฐานของสถาปัตยกรรม ARM
+
 ---
 
 ## 117.5 สร้างและรันโปรแกรม "Hello UART" บน QEMU จริง (Step 933)
@@ -455,6 +485,57 @@ field มีขนาดไม่เท่ากัน (ในตัวอย่
 ผสม `uint8_t`/`uint32_t` ต้องใช้ `#pragma pack` หรือ `__attribute__((packed))` ระวังเรื่องนี้
 เสมอเวลาออกแบบ struct สำหรับ memory-mapped I/O)
 
+### พิสูจน์ด้วย Assembly จริง: ทำไม `volatile` ถึงสำคัญขนาดนี้
+
+หัวข้อ 117.5 บอกไว้ว่าไม่ใส่ `volatile` แล้ว compiler อาจ optimize โค้ดจนพัง — ลองพิสูจน์
+จริงด้วยการดู assembly ที่ generate ออกมา เทียบกันระหว่างมี `volatile` กับไม่มี บนฟังก์ชัน
+`uart_putc` เดียวกัน compile ด้วย `-O2` ทั้งคู่:
+
+```bash
+# เวอร์ชันไม่มี volatile
+arm-none-eabi-gcc -mcpu=cortex-m3 -mthumb -ffreestanding -O2 -S test_novolatile.c -o novolatile.s
+# เวอร์ชันมี volatile (โค้ดจริงจากหัวข้อ 117.5)
+arm-none-eabi-gcc -mcpu=cortex-m3 -mthumb -ffreestanding -O2 -S test_volatile.c -o volatile.s
+```
+
+**Assembly ที่ได้แบบไม่มี `volatile`** (อ่านเฉพาะส่วนของ loop รอ UART ว่าง):
+
+```asm
+	ldr	r3, .L5
+	ldr	r2, [r3, #24]   @ อ่านค่า Flag Register แค่ "ครั้งเดียว"
+	lsls	r2, r2, #26
+	bpl	.L2
+.L3:
+	b	.L3             @ ถ้า bit ติด ก็วน infinite loop เปล่าๆ ไม่อ่านค่าซ้ำอีกเลย!
+.L2:
+	movs	r2, #72
+	str	r2, [r3]
+```
+
+**Assembly ที่ได้แบบมี `volatile`**:
+
+```asm
+	ldr	r2, .L5
+.L2:
+	ldr	r3, [r2, #24]   @ อ่านค่า Flag Register "ทุกรอบ" ของ loop
+	lsls	r3, r3, #26
+	bmi	.L2             @ ถ้ายัง full ก็วนกลับไปอ่านค่าใหม่อีกครั้ง — พฤติกรรมที่ถูกต้อง
+	movs	r3, #72
+	str	r3, [r2]
+```
+
+ความต่างชัดเจนมาก: เวอร์ชัน**ไม่มี** `volatile` compiler มองว่า `UART0_FR` เป็นแค่ตัวแปร
+ธรรมดาที่ไม่มีใครมาเปลี่ยนค่าระหว่างการวนลูป (เพราะในมุมมองของ compiler ไม่มีโค้ดบรรทัดไหน
+เขียนค่าใหม่ให้มันเลย) จึงสรุปว่า **"อ่านครั้งเดียวพอ ไม่ต้องอ่านซ้ำในลูป"** (เทคนิค
+optimization ที่เรียกว่า **Loop-Invariant Code Motion**) ผลคือถ้าตอนอ่านครั้งแรก UART
+บังเอิญไม่ว่าง (`TXFF` ติด) โปรแกรมจะติด `.L3: b .L3` เป็น **infinite loop จริงๆ ที่ไม่มีทาง
+ออกเลย** แม้ฮาร์ดแวร์จะว่างแล้วก็ตาม เพราะโค้ดไม่กลับไปอ่านค่าใหม่จากฮาร์ดแวร์อีกต่อไป —
+นี่คือบั๊กแบบที่ทดสอบตอน `-O0` (ไม่ optimize) แล้ว **ดูปกติดีทุกอย่าง** เพราะ `-O0` ไม่ทำ
+optimization นี้ แต่พอ build จริงด้วย `-O2` สำหรับ production กลับพังทันที — เป็นเหตุผลว่า
+ทำไมบั๊กเรื่อง `volatile` ถึงเป็นหนึ่งในบั๊กที่ตามหายากที่สุดในวงการ embedded และทำไมควร
+ทดสอบโค้ด embedded ด้วย optimization level เดียวกับที่จะใช้ใน production เสมอ ไม่ใช่แค่
+`-O0` ตอนพัฒนา
+
 ---
 
 ## 117.7 RTOS คืออะไร และทำไมบางครั้งจึงต้องใช้ (Step 935)
@@ -516,6 +597,52 @@ int main(void) {
     for (;;) { }            /* ไม่ควรมาถึงจุดนี้ถ้า scheduler ทำงานปกติ */
 }
 ```
+
+สังเกตว่า `xTaskCreate` รับพารามิเตอร์ตัวเลข **128** เป็นขนาด stack ของแต่ละ task (หน่วยเป็น
+word ไม่ใช่ byte) — นี่คือความแตกต่างสำคัญจาก thread บน Linux (Part 31) ที่ OS จัดสรร stack
+ขนาดใหญ่ให้อัตโนมัติ (มักเป็น MB) โดยไม่ต้องคิดมาก แต่บน RTOS ที่ RAM มีจำกัดมาก **ผู้เขียน
+โปรแกรมต้องกะขนาด stack ของแต่ละ task เองอย่างระมัดระวัง** — ตั้งน้อยเกินไปเสี่ยง stack
+overflow ทับ task อื่น ตั้งมากเกินไปจะเปลือง RAM ที่มีจำกัดโดยเปล่าประโยชน์
+
+### Synchronization บน RTOS: แนวคิดเดียวกับ Part 32 แต่ในสเกลเล็กกว่า
+
+FreeRTOS มี Mutex และ Queue ให้ใช้เหมือน `std::mutex` และการส่งข้อมูลระหว่าง thread ที่เรียน
+ใน Part 32 แนวคิดเรื่อง race condition และการป้องกันด้วย mutual exclusion เหมือนกันทุก
+ประการ เพียงแต่ implementation เบากว่ามากเพื่อให้พอดีกับ RAM ระดับ KB:
+
+```cpp
+#include "FreeRTOS.h"
+#include "queue.h"
+
+/* Queue คือวิธีมาตรฐานที่ RTOS ใช้ส่งข้อมูลระหว่าง task อย่างปลอดภัย
+ * แทนการแชร์ตัวแปร global ตรงๆ ที่เสี่ยง race condition */
+static QueueHandle_t sensor_queue;
+
+void sensor_task(void *pvParameters) {
+    (void)pvParameters;
+    int reading = 0;
+    for (;;) {
+        reading++; /* สมมติว่าอ่านค่าจริงจากเซนเซอร์ */
+        xQueueSend(sensor_queue, &reading, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void logger_task(void *pvParameters) {
+    (void)pvParameters;
+    int received;
+    for (;;) {
+        if (xQueueReceive(sensor_queue, &received, portMAX_DELAY) == pdTRUE) {
+            /* ส่งค่า received ออก UART หรือประมวลผลต่อ */
+        }
+    }
+}
+```
+
+รูปแบบ "ส่งข้อมูลผ่าน Queue แทนการแชร์ตัวแปรตรงๆ" นี้ปลอดภัยกว่าการใช้ mutex ล็อกตัวแปร
+global ธรรมดา เพราะ RTOS จัดการเรื่อง synchronization ให้ทั้งหมดภายใน `xQueueSend`/
+`xQueueReceive` เอง — เป็นแนวทางที่แนะนำในเอกสารของ FreeRTOS เองด้วย (คล้ายกับหลักการ
+"share memory by communicating" ที่พบในภาษาสมัยใหม่หลายภาษา)
 
 ### เมื่อไหร่ควรใช้ Bare-Metal, RTOS หรือ Linux เต็มรูปแบบ
 
@@ -680,6 +807,64 @@ Counting from 1 to 5:
 5
 Done!
 ```
+
+### แนวทางเฉลยข้อ 2
+
+```cpp
+/* main.c ฉบับแก้ไข */
+#include "uart.h"
+
+static void busy_delay(volatile uint32_t count) {
+    while (count--) { }
+}
+
+int main(void) {
+    uart_puts("Start\r\n");
+    for (int i = 0; i < 3; ++i) {
+        busy_delay(200000u);
+        uart_puts("tick\r\n");
+    }
+    uart_puts("End\r\n");
+    while (1) { }
+    return 0;
+}
+```
+
+สังเกตว่า parameter `count` ของ `busy_delay` ต้องเป็น `volatile` เช่นกัน (แม้จะเป็นแค่ตัวแปร
+local ธรรมดา ไม่ใช่ memory-mapped register) เพราะถ้าไม่ใส่ `volatile` compiler ที่ optimize
+ระดับสูง (`-O2` ขึ้นไป) จะมองว่าลูป `while (count--) { }` ไม่มีผลข้างเคียงใดๆ เลย (ไม่ได้
+เขียนอะไรที่มองเห็นได้จากภายนอกฟังก์ชัน) แล้ว**ลบลูปทั้งหมดทิ้งไปเลย** กลายเป็นฟังก์ชันว่าง
+เปล่าที่ไม่หน่วงเวลาอะไรเลย — นี่คือวิธีมาตรฐานง่ายๆ ที่ใช้หน่วงเวลาแบบ busy-wait โดยไม่ให้
+compiler optimize ทิ้ง (ในโค้ด production จริงมักใช้ hardware timer แทนแบบในหัวข้อ 117.6
+เพราะแม่นยำกว่าและไม่กิน CPU cycle ทิ้งเปล่าโดยไม่จำเป็น)
+
+Compile และรันบน QEMU ด้วย pipeline เดิม:
+
+```bash
+CPU_FLAGS="-mcpu=cortex-m3 -mthumb"
+arm-none-eabi-gcc $CPU_FLAGS -Wall -Wextra -ffreestanding -O2 -c main.c -o main.o
+arm-none-eabi-gcc $CPU_FLAGS -ffreestanding -nostdlib -T linker.ld startup.o main.o -o firmware.elf
+qemu-system-arm -M lm3s6965evb -nographic -kernel firmware.elf
+```
+
+ผลลัพธ์จริงที่ได้:
+
+```
+Timer with period zero, disabling
+Start
+tick
+tick
+tick
+End
+```
+
+**ทำไม busy-wait ไม่เหมาะกับระบบที่ต้องทำงานหลายอย่างพร้อมกัน**: ระหว่างที่ `busy_delay`
+กำลังวนลูปนับถอยหลัง CPU **ทำอะไรอย่างอื่นไม่ได้เลย** แม้แต่การตอบสนองต่อ interrupt สำคัญ
+(ขึ้นกับว่า interrupt ถูก disable ไว้หรือไม่) ถ้าระบบต้องอ่านเซนเซอร์ทุก 5ms พร้อมกับรับ
+คำสั่งผ่าน UART พร้อมกับหน่วงเวลาแสดงผล busy-wait จะทำให้งานอื่นทั้งหมด "ค้าง" รอจนกว่าการ
+หน่วงเวลาจะจบ ต่างจาก RTOS (หัวข้อ 117.7) ที่ใช้ `vTaskDelay()` ซึ่ง **คืน CPU ให้ task อื่น
+ทำงานระหว่างที่รอ** แทนที่จะ block CPU ทิ้งเปล่าเหมือน busy-wait — นี่คือเหตุผลหลักหนึ่งที่
+ระบบซับซ้อนขึ้นจึงหันไปใช้ RTOS แทน super loop ธรรมดา
 
 ### แนวทางเฉลยข้อ 3
 

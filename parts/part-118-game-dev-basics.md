@@ -743,7 +743,7 @@ context แบบเดียวกันนี้ผ่าน SDL2 (`SDL_GL_Cre
    composition/component ตั้งแต่ต้นถ้ารู้ว่าเกมจะมีตัวละครหลายแบบผสมความสามารถกันได้
 5. **เข้าใจผิดว่า `SDL_RENDERER_ACCELERATED` จะสำเร็จเสมอ** — บนเครื่อง headless, VM บาง
    ประเภท, หรือเครื่องที่ GPU driver มีปัญหา การสร้าง accelerated renderer อาจล้มเหลว ควร
-   เขียนโค้าง fallback ไปใช้ `SDL_RENDERER_SOFTWARE` เสมอเหมือนที่ทำในบทเรียนนี้ แทนที่จะ
+   เขียนโค้ด fallback ไปใช้ `SDL_RENDERER_SOFTWARE` เสมอเหมือนที่ทำในบทเรียนนี้ แทนที่จะ
    `assert` หรือ crash ทันทีเมื่อสร้างไม่สำเร็จ
 6. **ทำ physics/gameplay logic ด้วย variable timestep ตรงๆ สำหรับเกม multiplayer** —
    ทำให้ผลการคำนวณ physics ต่างกันเล็กน้อยระหว่างเครื่องผู้เล่นแต่ละคน (framerate ต่างกัน)

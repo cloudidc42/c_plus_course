@@ -672,7 +672,40 @@ Docker คือเครื่องมือมาตรฐาน (ทบท�
 เครื่อง Mac จริงหรือ CI ของ GitHub เพราะ macOS ไม่อนุญาตให้ virtualize บน hardware ที่ไม่ใช่
 ของ Apple ตามเงื่อนไข license (ยกเว้นบางบริการ cloud ที่ได้รับอนุญาตพิเศษ)
 
-### 4. ความจริงของบทเรียนนี้
+### 4. Cross-Compile ไปเป็นโปรแกรม Windows จริงจากเครื่อง Linux ด้วย MinGW-w64
+
+เทคนิคที่ทรงพลังอีกอย่างคือการ **cross-compile** โปรแกรมให้เป็น executable ของอีก OS หนึ่ง
+โดยไม่ต้องมีเครื่องนั้นเลย — เหมือนกับที่เราจะทำกับ ARM microcontroller ใน Part 117 แต่คราวนี้
+เป้าหมายคือ Windows `x86_64-w64-mingw32-g++` คือ compiler ที่ต่อยอดจาก GCC แต่ target เป็น
+Windows PE executable (`.exe`) แทน ELF ของ Linux
+
+ทดสอบจริงบนเครื่องที่ใช้เขียนบทเรียนนี้ (ติดตั้งผ่าน `sudo apt install g++-mingw-w64-x86-64`)
+โดยใช้ไฟล์ `platform_detect.cpp` ตัวเดียวกับหัวข้อ 116.2 **โดยไม่แก้โค้ดแม้แต่บรรทัดเดียว**:
+
+```bash
+sudo apt install -y g++-mingw-w64-x86-64
+x86_64-w64-mingw32-g++ -Wall -Wextra -std=c++17 platform_detect.cpp -o platform_detect.exe
+file platform_detect.exe
+```
+
+ผลลัพธ์จริงที่ได้:
+
+```
+platform_detect.exe: PE32+ executable (console) x86-64, for MS Windows, 19 sections
+```
+
+คำสั่ง `file` ยืนยันว่าไฟล์ที่ได้เป็น **PE32+ executable สำหรับ Windows จริง** (ไม่ใช่ ELF
+ของ Linux) — เกิดขึ้นบนเครื่อง Linux ล้วนๆ โดยไม่ต้องมี Windows เลยแม้แต่นิดเดียว โค้ดตัวนี้
+เมื่อ compile ด้วย MinGW จะเดินเข้าเส้นทาง `#if defined(_WIN32)` ในหัวข้อ 116.2 อัตโนมัติ
+(เพราะ MinGW define `_WIN32` ให้เหมือน MSVC ทุกประการเพื่อความเข้ากันได้) ข้อจำกัดที่ต้อง
+พูดตรงๆ คือ container นี้ไม่มี Windows หรือ Wine ให้ **รัน** ไฟล์ `.exe` นี้จริง จึงยืนยันได้
+แค่ว่า "compile และ link สำเร็จ ได้ binary format ที่ถูกต้องสำหรับ Windows" ส่วนการรันจริง
+ต้องทดสอบบนเครื่อง Windows จริงหรือผ่าน CI matrix (หัวข้อที่ 1) ที่มี Windows runner จริง —
+แต่เทคนิคนี้มีประโยชน์มากในทางปฏิบัติ: ทีมพัฒนาที่ใช้ Linux เป็นเครื่องพัฒนาหลักสามารถ
+สร้าง Windows build ไว้ทดสอบเบื้องต้น (เช่นเช็คว่า compile ผ่านไหม, link ผ่านไหม) ได้โดยไม่
+ต้องสลับเครื่องเลย
+
+### 5. ความจริงของบทเรียนนี้
 
 ทุกตัวอย่างโค้ดใน Part นี้ **compile และรันจริงบน Linux container ที่ไม่มีจอ** ที่ใช้เขียน
 บทเรียนนี้ — เราไม่มี Windows หรือ macOS ให้ทดสอบจริงในสภาพแวดล้อมนี้ ดังนั้นสิ่งที่ทำได้อย่าง
@@ -820,6 +853,52 @@ nm mylib.o | grep mylib_
 เทียบกับถ้าไม่ใส่ `extern "C"` (ลอง comment ออกแล้ว compile ใหม่) ชื่อใน `nm` จะกลายเป็น
 `_Z10mylib_addii` และ `_Z12mylib_squarei` ทันที ซึ่งพิสูจน์ให้เห็นชัดเจนว่า `extern "C"`
 คือกลไกเดียวที่ควบคุมว่า compiler จะ mangle ชื่อหรือไม่
+
+### แนวทางเฉลยข้อ 5
+
+```cpp
+#include <iostream>
+#include <cstdint>
+#include <arpa/inet.h>
+
+uint16_t my_htons(uint16_t host_value) {
+    return (uint16_t)((host_value >> 8) | (host_value << 8));
+}
+
+int main() {
+    uint16_t value = 0x1234;
+    uint16_t mine = my_htons(value);
+    uint16_t real = htons(value);
+    std::cout << "Input:        0x" << std::hex << value << "\n";
+    std::cout << "my_htons:     0x" << mine << "\n";
+    std::cout << "htons (libc): 0x" << real << "\n";
+    std::cout << "ตรงกันหรือไม่: " << (mine == real ? "ตรงกัน" : "ไม่ตรงกัน") << "\n";
+    return 0;
+}
+```
+
+ฟังก์ชัน `my_htons` เขียนขึ้นเองด้วย bit-shift ล้วนๆ: สลับ byte สูง (`host_value >> 8`)
+กับ byte ต่ำ (`host_value << 8`) แล้ว OR รวมกัน — เป็นการสลับ byte ด้วยมือแบบตรงไปตรงมา
+ทดสอบเทียบกับ `htons()` จริงจาก `<arpa/inet.h>`:
+
+```bash
+g++ -Wall -Wextra -std=c++17 ex5_htons.cpp -o ex5_htons
+./ex5_htons
+```
+
+ผลลัพธ์จริงที่ได้:
+
+```
+Input:        0x1234
+my_htons:     0x3412
+htons (libc): 0x3412
+ตรงกันหรือไม่: ตรงกัน
+```
+
+ยืนยันว่าฟังก์ชันที่เขียนเองให้ผลตรงกับ `htons()` มาตรฐานทุกประการ (เครื่องนี้เป็น
+little-endian จึงเห็นการสลับ byte ชัดเจนจาก `0x1234` เป็น `0x3412` — ถ้ารันบนเครื่อง
+big-endian จริง ทั้ง `my_htons` และ `htons` ของระบบจะคืนค่าเดิม `0x1234` โดยไม่สลับอะไรเลย
+เพราะ Network Byte Order ก็คือ Big-endian อยู่แล้ว)
 
 ---
 
