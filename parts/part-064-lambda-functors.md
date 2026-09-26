@@ -252,6 +252,43 @@ class ให้เราแบบอัตโนมัติ** นี่คื�
 ของ scope ที่ล้อมรอบไม่ได้เลย — ถ้าต้องการเข้าถึงตัวแปรภายนอกต้อง capture
 เข้ามาก่อน ซึ่งเป็นหัวข้อถัดไป
 
+Lambda ยังใช้แบบ **เรียกทันทีหลังนิยาม** ได้ด้วย เรียกว่า **IIFE**
+(Immediately Invoked Function Expression) มีประโยชน์เวลาต้องการ initialize
+ตัวแปร `const` ด้วย logic ที่ซับซ้อนกว่าหนึ่งบรรทัด (เช่นต้องมีลูปหรือเงื่อนไข
+ระหว่างทาง) โดยไม่ต้องเขียนฟังก์ชันแยกไว้ข้างนอกเพียงเพื่อ initialize ค่าเดียว:
+
+```cpp
+#include <cstdio>
+
+int main(void) {
+    // Immediately Invoked Function Expression (IIFE): เรียก lambda ทันทีหลังนิยาม
+    // มีประโยชน์เวลาต้องการ initialize ตัวแปร const ด้วย logic ที่ซับซ้อนกว่าหนึ่งบรรทัด
+    const int result = []() {
+        int total = 0;
+        for (int i = 1; i <= 5; ++i) {
+            total += i;
+        }
+        return total;
+    }();
+
+    std::printf("result = %d\n", result);
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 iife_demo.cpp -o iife_demo
+./iife_demo
+# result = 15
+```
+
+สังเกตวงเล็บ `()` ตัวสุดท้ายต่อท้ายตัว lambda เอง (`}();`) นั่นคือส่วนที่ทำให้
+lambda **ถูกเรียกทันที** หลังนิยามเสร็จ ผลลัพธ์ที่ได้ (ไม่ใช่ตัว lambda) ถูก
+นำไป initialize ตัวแปร `result` ที่เป็น `const` ได้เลยในบรรทัดเดียว — เทคนิคนี้
+ช่วยให้ `result` เป็น `const` ได้อย่างแท้จริงตั้งแต่ตอนประกาศ (ไม่ต้องประกาศ
+แบบไม่ใส่ `const` ก่อนแล้วค่อยมาคำนวณด้วยลูปทีหลัง)
+
 ---
 
 ## 64.4 Capture by Value vs Capture by Reference (Step 508)
@@ -331,6 +368,51 @@ a ใน main หลังเรียก lambda = 101
 `[&]`/capture by reference เมื่อต้องการให้ lambda เห็นค่าล่าสุดเสมอ หรือต้องการ
 แก้ไขตัวแปรภายนอกจริงๆ ผ่าน lambda — แต่การ capture by reference มีความเสี่ยง
 สำคัญที่ต้องระวังมาก ซึ่งจะพูดถึงใน Common Pitfalls ท้ายบท
+
+**Init Capture (C++14)**: นอกจาก capture ตัวแปรที่มีอยู่แล้วตรงๆ C++14 ยัง
+อนุญาตให้ **สร้างตัวแปรใหม่** ขึ้นมาภายใน capture list ได้เลย ด้วยรูปแบบ
+`[ชื่อใหม่ = expression]` ประโยชน์สำคัญที่สุดของฟีเจอร์นี้คือการ **ย้าย
+(move)** ทรัพยากรที่คัดลอกไม่ได้ (เช่น `std::unique_ptr` ที่จะเรียนละเอียดใน
+Part 67) เข้าไปเก็บไว้ใน lambda โดยตรง:
+
+```cpp
+#include <cstdio>
+#include <memory>
+
+int main(void) {
+    int x = 10;
+
+    // Init Capture (C++14): สร้างตัวแปรใหม่ภายใน capture list ได้โดยตรง
+    auto lam = [y = x * 2]() {
+        std::printf("y = %d\n", y);
+    };
+    lam();
+
+    // ประโยชน์สำคัญ: ใช้ "ย้าย" (move) ทรัพยากรที่ copy ไม่ได้เข้าไปใน lambda
+    auto ptr = std::make_unique<int>(99);
+    auto lam2 = [p = std::move(ptr)]() {
+        std::printf("p = %d\n", *p);
+    };
+    lam2();
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 init_capture.cpp -o init_capture
+./init_capture
+# y = 20
+# p = 99
+```
+
+`[y = x * 2]` สร้างตัวแปรชื่อ `y` ขึ้นมาใหม่ภายใน closure object โดยคำนวณค่า
+จาก expression `x * 2` ทันที (ต่างจาก `[x]` ที่แค่คัดลอกค่าตรงๆ โดยไม่แปลง)
+ส่วน `[p = std::move(ptr)]` คือรูปแบบที่สำคัญกว่ามาก — มันย้ายความเป็นเจ้าของ
+ของ `std::unique_ptr` เข้าไปอยู่ใน lambda โดยตรง (หลังจากบรรทัดนี้ `ptr` ใน
+`main()` จะกลายเป็น `nullptr` เพราะถูกย้ายออกไปแล้ว) ซึ่งเป็นวิธีเดียวที่ถูก
+ต้องในการนำทรัพยากรที่ copy ไม่ได้เข้าไปอยู่ใน lambda (ก่อน C++14 ทำแบบนี้ไม่ได้
+เลย เพราะ capture ได้แค่ by value กับ by reference เท่านั้น)
 
 ---
 
@@ -522,6 +604,55 @@ void call(F f)`) แต่ในโค้ดทั่วไป โดยเฉ�
 Callable ไว้ใช้ภายหลัง `std::function` คือทางเลือกที่เหมาะสมที่สุดเพราะความ
 ยืดหยุ่นที่ได้มาคุ้มค่ากับ overhead เล็กน้อยที่เสียไป
 
+`std::function` ยังใช้เก็บการเรียก **member function** ของ object ใดๆ ได้ด้วย
+โดยห่อผ่าน lambda ที่ capture object นั้นเข้ามา (วิธีนี้เข้าใจง่ายและเพียงพอ
+สำหรับงานส่วนใหญ่ — ภาษา C++ ยังมี `std::bind` และ `std::mem_fn` ที่ทำสิ่งนี้
+ได้เช่นกันโดยไม่ต้องเขียน lambda เอง แต่ในโค้ดสมัยใหม่นิยมใช้ lambda มากกว่า
+เพราะอ่านง่ายกว่าเห็นๆ):
+
+```cpp
+#include <cstdio>
+#include <functional>
+#include <string>
+#include <utility>
+
+class Logger {
+public:
+    explicit Logger(std::string prefix) : prefix_(std::move(prefix)) {}
+    void log(const std::string& msg) const {
+        std::printf("[%s] %s\n", prefix_.c_str(), msg.c_str());
+    }
+
+private:
+    std::string prefix_;
+};
+
+int main(void) {
+    Logger logger("APP");
+
+    // เก็บการเรียก member function ไว้ใน std::function ผ่าน lambda ที่ capture object
+    std::function<void(const std::string&)> log_func =
+        [&logger](const std::string& msg) { logger.log(msg); };
+
+    log_func("เริ่มต้นโปรแกรม");
+    log_func("ทำงานเสร็จสมบูรณ์");
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 member_callback.cpp -o member_callback
+./member_callback
+# [APP] เริ่มต้นโปรแกรม
+# [APP] ทำงานเสร็จสมบูรณ์
+```
+
+รูปแบบนี้พบบ่อยมากเวลาต้องส่ง "การกระทำ" ของ object หนึ่งไปให้โค้ดส่วนอื่นที่
+ไม่รู้จัก class `Logger` เลยด้วยซ้ำ (เช่น ส่ง `log_func` เข้าไปเป็นพารามิเตอร์
+ของฟังก์ชันอื่นที่รับแค่ `std::function<void(const std::string&)>`) — เป็นการ
+แยก **"สิ่งที่ต้องทำ"** ออกจาก **"ใครเป็นคนทำ"** ได้อย่างสมบูรณ์
+
 ---
 
 ## 64.8 ตัวอย่างจริง: ระบบ Callback ด้วย std::function (Step 512)
@@ -614,6 +745,78 @@ exception ถ้าเรียกโดยไม่เช็คก่อน)
 ใช้กันอย่างแพร่หลายในโค้ดจริง ตั้งแต่ GUI Framework, Game Engine, ไปจนถึง
 Networking Library ที่ต้อง "แจ้งเตือน" เมื่อมีเหตุการณ์เกิดขึ้น โดยไม่ต้องผูก
 โค้ดส่วนที่ตรวจจับเหตุการณ์เข้ากับโค้ดส่วนที่ตอบสนองต่อเหตุการณ์นั้นโดยตรง
+
+`Button` ในตัวอย่างข้างต้นรองรับ callback ได้แค่ **ตัวเดียวต่อปุ่ม** แต่ระบบ
+Event จริงๆ มักต้องการให้เหตุการณ์เดียวแจ้งเตือนไปยัง **ผู้ฟังหลายคนพร้อมกัน**
+(one-to-many) ทำได้ง่ายๆ ด้วยการเก็บ `std::function` ไว้ใน
+`std::vector` แทนที่จะเก็บแค่ตัวเดียว:
+
+```cpp
+#include <cstdio>
+#include <functional>
+#include <vector>
+#include <string>
+#include <utility>
+
+class EventBus {
+public:
+    void subscribe(std::function<void(const std::string&)> handler) {
+        handlers_.push_back(std::move(handler));
+    }
+
+    void publish(const std::string& event) const {
+        for (const auto& handler : handlers_) {
+            handler(event);
+        }
+    }
+
+private:
+    std::vector<std::function<void(const std::string&)>> handlers_;
+};
+
+int main(void) {
+    EventBus bus;
+
+    bus.subscribe([](const std::string& event) {
+        std::printf("[Logger] เหตุการณ์เกิดขึ้น: %s\n", event.c_str());
+    });
+
+    int notify_count = 0;
+    bus.subscribe([&notify_count](const std::string& event) {
+        ++notify_count;
+        std::printf("[Counter] นับได้ %d ครั้ง (ล่าสุด: %s)\n", notify_count, event.c_str());
+    });
+
+    bus.publish("user_login");
+    bus.publish("user_logout");
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 event_bus.cpp -o event_bus
+./event_bus
+```
+
+ผลลัพธ์:
+
+```
+[Logger] เหตุการณ์เกิดขึ้น: user_login
+[Counter] นับได้ 1 ครั้ง (ล่าสุด: user_login)
+[Logger] เหตุการณ์เกิดขึ้น: user_logout
+[Counter] นับได้ 2 ครั้ง (ล่าสุด: user_logout)
+```
+
+`EventBus::subscribe()` รับ callback กี่ตัวก็ได้และเก็บไว้ใน
+`std::vector<std::function<void(const std::string&)>>` เมื่อ `publish()`
+ถูกเรียก มันจะวนเรียก `handler(event)` ของทุก callback ที่ลงทะเบียนไว้ตามลำดับ
+ที่ subscribe เข้ามา — สังเกตว่า `Logger` handler ไม่ capture อะไรเลย (ทำงาน
+แบบ stateless) ในขณะที่ `Counter` handler capture `notify_count` by reference
+เพื่อสะสมค่าไว้ข้ามการเรียกแต่ละครั้ง (คล้ายกับที่ Functor ทำได้ใน 64.2 แต่ทำ
+ผ่าน lambda ที่ capture ตัวแปรจาก scope ภายนอกแทนการเก็บเป็น member ของ class
+เอง) นี่คือรูปแบบพื้นฐานที่สุดของสิ่งที่เรียกว่า **Signal/Slot** หรือ
+**Publish-Subscribe Pattern** ในโปรแกรมระดับ Production จริง
 
 ---
 

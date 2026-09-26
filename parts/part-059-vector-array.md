@@ -343,11 +343,27 @@ int main() {
 | ใช้เมื่อไหร่ | รู้จำนวนสูงสุดที่จะ push_back แต่ยังไม่อยากมีสมาชิกจริง | ต้องการให้ vector มีสมาชิกจริง n ตัวทันที |
 
 ```cpp
-std::vector<int> a;
-a.reserve(10);        // a.size() == 0, a.capacity() >= 10 — เข้าถึง a[0] ยังคง UB!
+#include <iostream>
+#include <vector>
 
-std::vector<int> b;
-b.resize(10);         // b.size() == 10, ทุกตัวเป็น 0 (ค่า default ของ int) — a[0] ใช้ได้ทันที
+int main() {
+    std::vector<int> a;
+    a.reserve(10);   // a.size() == 0, a.capacity() >= 10 -- เข้าถึง a[0] ยังคง UB!
+    std::cout << "a.size() = " << a.size() << ", a.capacity() = " << a.capacity() << '\n';
+
+    std::vector<int> b;
+    b.resize(10);    // b.size() == 10, ทุกตัวเป็น 0 (ค่า default ของ int) -- b[0] ใช้ได้ทันที
+    std::cout << "b.size() = " << b.size() << ", b[0] = " << b[0] << '\n';
+
+    return 0;
+}
+```
+
+ผลลัพธ์:
+
+```
+a.size() = 0, a.capacity() = 10
+b.size() = 10, b[0] = 0
 ```
 
 > **กฎทองข้อสำคัญ**: ถ้ารู้จำนวนข้อมูลล่วงหน้า (เช่น อ่านจากไฟล์ที่รู้จำนวนบรรทัด หรือรับ
