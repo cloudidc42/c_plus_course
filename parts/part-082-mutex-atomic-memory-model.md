@@ -588,6 +588,11 @@ Part 32 หัวข้อ 32.7 สาธิตให้เห็นว่าก
 มาดูปัญหาเดียวกันในสไตล์ `std::mutex` ก่อน:
 
 ```cpp
+#include <chrono>
+#include <iostream>
+#include <mutex>
+#include <thread>
+
 struct Account {
     int balance;
     std::mutex m;
@@ -601,6 +606,21 @@ void transfer_naive(Account& from, Account& to, int amount) {
     std::lock_guard<std::mutex> lock2(to.m);
     from.balance -= amount;
     to.balance += amount;
+    std::cout << "[transfer_naive] โอน " << amount << " สำเร็จ\n";
+}
+
+int main() {
+    Account a(1000);
+    Account b(1000);
+
+    std::thread t1(transfer_naive, std::ref(a), std::ref(b), 100); // ล็อก a ก่อน b
+    std::thread t2(transfer_naive, std::ref(b), std::ref(a), 200); // ล็อก b ก่อน a -- สลับกัน!
+
+    t1.join();
+    t2.join();
+
+    std::cout << "[main] จบโปรแกรม (ไม่ควรมาถึงถ้า deadlock)\n";
+    return 0;
 }
 ```
 

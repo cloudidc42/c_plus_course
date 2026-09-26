@@ -238,6 +238,8 @@ Cache Line (64 bytes) = int[0] ถึง int[15] ถูกดึงเข้า 
 ตัวอย่างโค้ดที่ใช้ทั้งสองหลักการได้ดี:
 
 ```cpp
+#include <vector>
+
 double sum_good(const std::vector<double>& v) {
     double total = 0.0;              // temporal locality: total ถูกใช้ซ้ำทุกรอบ, ค้างใน register
     for (double x : v) {             // spatial locality: v[0], v[1], v[2], ... เรียงติดกันใน memory
@@ -351,7 +353,7 @@ struct ParticleAoS {
     float charge;
 }; // 8 floats = 32 bytes ต่อ 1 อนุภาค
 
-std::vector<ParticleAoS> particles(N);
+// การใช้งาน: std::vector<ParticleAoS> particles(จำนวนอนุภาค);
 ```
 
 ในหน่วยความจำ ข้อมูลจะเรียงเป็น: `[x0 y0 z0 vx0 vy0 vz0 m0 c0][x1 y1 z1 vx1 vy1 vz1 m1 c1]...`
@@ -360,6 +362,8 @@ std::vector<ParticleAoS> particles(N);
 ### แบบที่ 2: Structure of Arrays (SoA) — แยก field ออกเป็นคนละ array
 
 ```cpp
+#include <vector>
+
 struct ParticlesSoA {
     std::vector<float> x, y, z;
     std::vector<float> vx, vy, vz;
@@ -669,6 +673,9 @@ hardware_destructive_interference_size = 64
 ตัวเลข literal `64` เพื่อให้โค้ด portable ข้าม platform:
 
 ```cpp
+#include <new>
+#include <atomic>
+
 struct alignas(std::hardware_destructive_interference_size) PaddedCounter {
     std::atomic<long long> value;
     char pad[std::hardware_destructive_interference_size - sizeof(std::atomic<long long>)];
@@ -730,6 +737,9 @@ this used?)"** แล้วจึงออกแบบ layout ของข้อ
 ### ตัวอย่างแนวคิด: จาก OOP สู่ DOD
 
 ```cpp
+#include <string>
+#include <vector>
+
 // ---------- สไตล์ OOP ดั้งเดิม: รวมทุกอย่างไว้ในคลาสเดียว ----------
 class GameObjectOOP {
 public:
