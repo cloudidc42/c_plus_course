@@ -142,6 +142,29 @@ Module K ปิดท้ายด้วยโปรเจกต์ใหญ่ 4
 > เจอโจทย์ที่ต้องใช้ Concurrency) ให้กลับมาที่ตารางนี้ก่อน แล้วไล่กลับไปอ่าน Part ที่เกี่ยวข้อง
 > แทนการค้นหาแบบสุ่มบนอินเทอร์เน็ต เพราะเนื้อหาที่นี่ถูกจัดลำดับและเชื่อมโยงกันไว้แล้ว
 
+### จุดเชื่อมโยงข้าม Module ที่สำคัญ
+
+Skills Map ข้างต้นแสดงแต่ละ Module แยกจากกัน แต่ในความเป็นจริง **ทักษะเหล่านี้ไม่ได้ทำงานแยกกัน
+เลยในระบบจริง** — ความเข้าใจว่า Module ไหนพึ่งพา Module ไหนคือสิ่งที่ทำให้แก้ปัญหาที่ซับซ้อนได้
+เร็วขึ้นมาก เพราะรู้ว่าเมื่อเจอปัญหาในชั้นบน ต้นตอมักอยู่ที่ชั้นล่างเสมอ:
+
+- **Module I (Web Development) ยืนอยู่บน Module C (Systems Programming) ทั้งหมด** — Crow และ
+  Pistache ที่ใช้ใน Part 102-104 เป็นแค่ชั้นห่อหุ้ม (wrapper) ของ Socket API ที่เรียนใน Part 33-34
+  เมื่อ HTTP Server ทำงานช้าผิดปกติ ต้นตอมักไม่ใช่ปัญหาที่ชั้น Framework แต่อยู่ที่ระดับ Socket/
+  Thread ข้างล่าง — Capstone 4 (Part 124) ถูกออกแบบมาเพื่อพิสูจน์ความเชื่อมโยงนี้โดยตรง
+- **Module F (Modern C++) คือการ "ห่อหุ้ม" วินัยที่เรียนใน Module D-E ให้เป็นอัตโนมัติ** —
+  `unique_ptr` (Part 67) ไม่ได้ทำอะไรที่ทำเองไม่ได้ มันแค่บังคับให้วินัยเรื่อง RAII ที่เรียนใน
+  Part 46 เกิดขึ้นเองโดยไม่ต้องอาศัยความจำของโปรแกรมเมอร์
+- **Module G (Concurrency) และ Module C (pthread) สอนแนวคิดเดียวกันคนละระดับ** — Mutex, Race
+  Condition, Deadlock ที่เรียนด้วย `pthread_mutex_t` ใน Part 32 คือแนวคิดเดียวกับ `std::mutex`
+  ใน Part 82 เพียงแต่ Modern C++ ห่อหุ้มให้ปลอดภัยกว่า (RAII ผ่าน `lock_guard`)
+- **Module H (Tooling) คือ "เกราะป้องกัน" ของทุก Module ก่อนหน้า** — Sanitizer (Part 96) จับบั๊ก
+  ที่มาจาก Module A-B-C (Memory), Static Analysis (Part 95) จับปัญหาที่มาจาก Module D-F (Design/
+  Style) และ Unit Test (Part 93) ยืนยันความถูกต้องของ Logic จากทุก Module รวมกัน
+
+การเห็นความเชื่อมโยงเหล่านี้คือสัญญาณว่าความรู้ในหลักสูตรนี้ **ประกอบกันเป็นระบบเดียว** ไม่ใช่
+ชุดของหัวข้อที่แยกจากกัน 125 เรื่อง
+
 ---
 
 ## 125.3 สิ่งที่หลักสูตรนี้ยังไม่ครอบคลุมลึก และควรไปต่อที่ไหน (Step 995)
@@ -160,12 +183,28 @@ Module K ปิดท้ายด้วยโปรเจกต์ใหญ่ 4
 | **Compiler / Language Implementation** | Metaprogramming และ Template ขั้นสูง (Part 78-79) ที่เป็น "การเขียนโปรแกรมที่ compile-time ทำงานให้" แต่ไม่ใช่การสร้างคอมไพเลอร์ | การสร้างคอมไพลเลอร์ต้องมีความรู้ Lexer/Parser/AST/Code Generation/Optimization Pass ซึ่งเป็นวิชาเฉพาะทางเต็มเทอมในมหาวิทยาลัย | หนังสือ *Crafting Interpreters* (Robert Nystrom, อ่านฟรีออนไลน์), LLVM "Kaleidoscope" Tutorial, หนังสือ *Engineering a Compiler* |
 | **Formal Verification / Proof of Correctness** | Assertion, Unit Test, Sanitizer (Part 16, 93, 96) ที่ตรวจจับบั๊กเชิงประจักษ์ | Formal Verification พิสูจน์ความถูกต้อง 100% ทางคณิตศาสตร์ ต่างจากการทดสอบที่พิสูจน์ได้แค่ "เท่าที่ทดสอบ" ซึ่งต้องใช้พื้นฐาน Logic/Type Theory เพิ่มเติมมาก | TLA+ (เครื่องมือของ Leslie Lamport ผู้คิดค้น Paxos), หนังสือ *Practical TLA+* |
 | **Database Internals ระดับ Production** | การ**ใช้** SQLite/PostgreSQL ผ่าน library (Part 105-106) และสร้าง Storage Engine อย่างง่าย (Part 40, 123) | Database จริงต้องมี WAL, MVCC, Query Optimizer, B-Tree/LSM-Tree ระดับ production ซึ่งแต่ละส่วนเป็นระบบวิศวกรรมที่ซับซ้อนมาก | หนังสือ *Database Internals* (Alex Petrov), source code ของ SQLite (เขียนอ่านง่ายที่สุดในบรรดา DB Engine จริง) |
+| **โปรโตคอลเครือข่ายระดับลึก (TLS Internals, HTTP/2-3, QUIC)** | การ**ใช้** HTTPS ผ่าน library สำเร็จรูปและแนวคิด JWT (Part 110) | หลักสูตรนี้สอนวิธี "ใช้ Security อย่างถูกต้อง" ไม่ใช่วิธี "implement Cryptographic Protocol เอง" ซึ่งเป็นสาขาที่ต้องระวังเรื่องความปลอดภัยสูงมากและไม่ควรทำเองในงานจริงอยู่แล้ว | RFC ของ TLS 1.3 (RFC 8446) และ QUIC (RFC 9000), หนังสือ *Real-World Cryptography* (David Wong) |
+| **ภาษาระบบสมัยใหม่อื่น (เช่น Rust) เพื่อเปรียบเทียบมุมมอง** | ไม่ได้แตะเลย หลักสูตรนี้โฟกัส C/C++ ล้วน | การเรียนสองภาษาระบบพร้อมกันตั้งแต่ต้นจะทำให้พื้นฐานทั้งสองภาษาไม่แน่นพอ จึงตั้งใจให้ลึกด้าน C/C++ ก่อนแล้วค่อยเปรียบเทียบทีหลัง | The Rust Programming Language (rust-lang.org, อ่านฟรี) — การเข้าใจ Ownership ของ Rust จะลึกซึ้งขึ้นมากเพราะมีพื้นฐาน RAII/Smart Pointer จาก Part 67-68 มาแล้ว |
 
 > **สิ่งสำคัญที่สุดของหัวข้อนี้ไม่ใช่รายการหนังสือ** แต่คือการเข้าใจว่า **พื้นฐานที่แน่นจาก
 > หลักสูตรนี้ทำให้หัวข้อขั้นสูงเหล่านี้ "เข้าถึงได้" ไม่ใช่ "เข้าถึงไม่ได้"** — คนที่เข้าใจ
 > Pointer, Memory Layout, Concurrency Primitive และ Systems Programming จาก Part 1-40 มาแล้ว
 > จะอ่านหนังสือ *Designing Data-Intensive Applications* หรือ CUDA Programming Guide ได้ง่ายกว่า
 > คนที่กระโดดเข้าไปอ่านโดยไม่มีพื้นฐานเหล่านี้มาก่อนอย่างมหาศาล
+
+### หลักการเลือกว่าจะเจาะลึกหัวข้อไหนก่อน
+
+เมื่อเห็นรายการหัวข้อที่ยังไม่ได้ครอบคลุมลึกทั้งหมดนี้ อาจรู้สึกท่วมท้นได้ง่าย — ใช้หลักการ
+ต่อไปนี้ในการเลือกลำดับ แทนที่จะพยายามเรียนทุกอย่างพร้อมกัน:
+
+1. **เลือกตามเป้าหมายอาชีพก่อนเสมอ** — ถ้าไม่ได้จะทำงานสาย Embedded ไม่จำเป็นต้องอ่าน RTOS
+   ให้ลึกตอนนี้ หัวข้อ 125.4 จะช่วยจับคู่เป้าหมายกับหัวข้อที่ควรเจาะลึกก่อน
+2. **เลือกตามสิ่งที่ใช้ในงานปัจจุบัน** — ถ้าทำงาน Backend อยู่แล้วแต่ระบบเริ่มมีปัญหาเรื่อง
+   Consistency ให้อ่าน Designing Data-Intensive Applications ก่อนหัวข้ออื่นทันที เพราะเป็นปัญหา
+   ที่เกิดขึ้นจริงตรงหน้า ไม่ใช่ความรู้ทั่วไป
+3. **อย่าอ่านหัวข้อขั้นสูงโดยข้ามพื้นฐาน** — คนที่ยังไม่มั่นใจเรื่อง Concurrency พื้นฐาน (Module G)
+   ไม่ควรกระโดดไปอ่าน Lock-free Data Structure ขั้นสูงหรือ Raft ทันที เพราะจะไม่เข้าใจว่าทำไม
+   ปัญหาถึงยากขนาดนั้น
 
 ---
 
@@ -182,6 +221,21 @@ Module K ปิดท้ายด้วยโปรเจกต์ใหญ่ 4
 | **Embedded / IoT / Firmware Engineer** | เรียน Zephyr RTOS หรือ FreeRTOS ให้ลึกกว่า Part 117, หาบอร์ดจริง (STM32/ESP32) มาฝึก, ศึกษา Datasheet ของ MCU 1 รุ่นให้ละเอียด | สร้างโปรเจกต์ IoT ที่มี Sensor จริง + Firmware + สื่อสารผ่าน MQTT กลับมาที่ Server ที่เขียนด้วย C++ (ต่อยอด Module I) | ส่งโปรเจกต์เข้าแข่งขัน Embedded/IoT หรือสมัคร Certification ของ ARM/ผู้ผลิต MCU |
 | **Open Source Contributor สาย C++** | ทำตามขั้นตอน Part 120.5-120.7 อย่างจริงจัง: เลือก 1-2 โปรเจกต์ (เช่น nlohmann/json, fmt, LLVM ส่วนเล็กๆ) แล้วอ่าน codebase ให้เข้าใจก่อน | ส่ง PR เล็กๆ อย่างน้อย 5 ครั้ง (แก้บั๊ก/เพิ่ม test/ปรับเอกสาร) เพื่อเรียนรู้ workflow ของแต่ละโปรเจกต์ให้คล่อง | เป็น Regular Contributor ของโปรเจกต์ใดโปรเจกต์หนึ่งอย่างสม่ำเสมอ จนได้รับสิทธิ์ Triage Issue หรือ Review PR คนอื่น |
 | **Distributed Systems / Data Infrastructure Engineer** | อ่าน *Designing Data-Intensive Applications* ให้จบ, ศึกษา Raft ให้เข้าใจจริง (ไม่ใช่แค่แนวคิด) | ต่อยอด Capstone 3 (Part 123) ให้ implement Raft Consensus จริงแทน Replication แบบง่าย พร้อมทดสอบ Network Partition ด้วย Chaos Testing | เขียน Blog Post อธิบายการ implement Raft ของตัวเอง พร้อม Benchmark เรื่อง Latency/Throughput ภายใต้ Failure Scenario ต่างๆ |
+| **Security / Low-level Reverse Engineering Engineer** | เจาะลึก Part 115 (Security ใน C/C++) ต่อด้วยการเรียน Buffer Overflow, ASLR, Stack Canary ให้ลึกกว่าภาพรวม, ฝึกใช้ `objdump`/`radare2` อ่าน Binary | เข้าร่วม CTF (Capture The Flag) สาย Binary Exploitation อย่างน้อยเดือนละ 1 งาน เพื่อฝึกอ่าน Assembly ที่เจอใน Part 89 ในบริบทของช่องโหว่จริง | ส่ง Write-up การแก้โจทย์ CTF หรือรายงานช่องโหว่ (Responsible Disclosure) เข้าโปรแกรม Bug Bounty อย่างน้อย 1 ครั้ง |
+
+### ตัวอย่างแผนแบบละเอียด: เดือนแรกของสาย Backend/Infrastructure
+
+เพื่อให้ตารางข้างต้นไม่ใช่แค่แนวคิดลอยๆ นี่คือตัวอย่างการแตกเป็นแผนรายสัปดาห์ของเดือนแรก
+สำหรับคนที่เลือกเส้นทาง Backend/Infrastructure Engineer — ใช้เป็นต้นแบบปรับกับเส้นทางอื่นได้:
+
+- **สัปดาห์ 1-2**: ดูวิดีโอ MIT 6.824 บทที่ 1-4 (Introduction, RPC, Primary-Backup Replication)
+  คู่ขนานไปกับการอ่านโค้ด Capstone 3 (Part 123) ของตัวเองซ้ำ แล้วโน้ตว่าจุดไหนที่เป็น
+  Replication แบบง่ายเทียบกับสิ่งที่วิดีโอสอน
+- **สัปดาห์ 3**: อ่าน *Designing Data-Intensive Applications* บทที่ 5 (Replication) และบทที่ 9
+  (Consistency and Consensus) เชื่อมโยงกับสิ่งที่ดูใน MIT 6.824
+- **สัปดาห์ 4**: ตั้งเป้าเล็กๆ ที่ทำได้จริง — เพิ่ม Health Check endpoint และ Retry Logic แบบง่าย
+  เข้าไปใน Capstone 1 (E-Commerce API) เพื่อเริ่มคุ้นเคยกับแนวคิดเรื่อง Reliability ก่อนไปแตะ
+  เรื่อง Consensus ที่ซับซ้อนกว่าในเดือนถัดไป
 
 ### หลักการเลือกเป้าหมายที่ควรระลึกไว้เสมอ
 
@@ -239,6 +293,22 @@ Module K ปิดท้ายด้วยโปรเจกต์ใหญ่ 4
 | r/cpp (Reddit) | ชุมชนติดตามข่าวสาร C++ ที่แอคทีฟที่สุด ใช้ตามข่าว Proposal ใหม่และบทความคุณภาพสูง |
 | Slack "cpplang" | ชุมชนแชทสด ถามตอบปัญหา C++ กับวิศวกรทั่วโลกแบบ real-time |
 
+### Podcast, YouTube Channel และ Newsletter สำหรับติดตามต่อเนื่อง
+
+| แหล่งข้อมูล | ใช้ทำอะไร |
+|---|---|
+| *C++ Weekly* (YouTube, Jason Turner) | คลิปสั้น 10-20 นาที อธิบายฟีเจอร์ C++ ทีละประเด็นลึกๆ เหมาะดูสัปดาห์ละคลิปเพื่อรักษาความสดของความรู้ Modern C++ |
+| *CppCast* (Podcast) | พอดแคสต์รายสัปดาห์ สัมภาษณ์บุคคลสำคัญในวงการ C++ รวมถึงสมาชิกคณะกรรมการมาตรฐาน |
+| *This Week in C++* (Newsletter/บล็อกรวมข่าว) | สรุปข่าวสาร บทความ และ Proposal ใหม่ประจำสัปดาห์ ช่วยตามข่าวโดยไม่ต้องไล่อ่านทุกแหล่งเอง |
+
+### หนังสือ — Security และ Software Engineering Practice เพิ่มเติม
+
+| หนังสือ | ผู้เขียน | ทำไมถึงควรอ่าน |
+|---|---|---|
+| *The CERT C++ Secure Coding Standard* | CERT/SEI | ต่อยอด Part 115 (Security ใน C/C++) ด้วยกฎการเขียนโค้ดปลอดภัยที่เป็นมาตรฐานอุตสาหกรรม |
+| *Code Complete* | Steve McConnell | หลักการเขียนโค้ดคุณภาพสูงที่ไม่ผูกกับภาษาใดภาษาหนึ่ง เสริมแนวคิดจาก Part 113 (Clean Code) |
+| *Working Effectively with Legacy Code* | Michael Feathers | สำคัญมากสำหรับงานจริง เพราะโค้ดส่วนใหญ่ในบริษัทคือ "Legacy Code" ที่ต้องแก้โดยไม่ทำของเดิมพัง ต่อยอดแนวคิด Refactor vs Rewrite จาก Part 114 |
+
 ### หัวข้อเฉพาะทาง (ต่อเนื่องจากหัวข้อ 125.3)
 
 | หัวข้อ | แหล่งเรียนรู้ |
@@ -249,6 +319,9 @@ Module K ปิดท้ายด้วยโปรเจกต์ใหญ่ 4
 | Compiler/Language | *Crafting Interpreters* (อ่านฟรีที่ craftinginterpreters.com), LLVM Kaleidoscope Tutorial |
 | Database Internals | *Database Internals* (Alex Petrov), source code ของ SQLite |
 | Security | The CERT C++ Secure Coding Standard, ต่อยอดจาก Part 115 |
+| Rust / ภาษาระบบเปรียบเทียบ | *The Rust Programming Language* (rust-lang.org) |
+| TLS/Networking ระดับลึก | RFC 8446 (TLS 1.3), RFC 9000 (QUIC), หนังสือ *Real-World Cryptography* |
+| Legacy Code / Software Engineering Practice | *Working Effectively with Legacy Code* (Michael Feathers), *Code Complete* (Steve McConnell) |
 
 ---
 
@@ -265,6 +338,7 @@ Module K ปิดท้ายด้วยโปรเจกต์ใหญ่ 4
 - [ ] เขียนโปรแกรมที่ใช้ `malloc/realloc/free` โดยไม่มี memory leak (ยืนยันด้วย Valgrind)
 - [ ] Implement Singly Linked List และ Binary Search Tree จากศูนย์โดยไม่เปิดดูตัวอย่าง
 - [ ] วิเคราะห์ Time Complexity ของอัลกอริทึมที่เขียนเองได้ถูกต้องด้วย Big-O
+- [ ] อธิบายว่าทำไม `#include` guard (หรือ `#pragma once`) ถึงจำเป็นในโปรเจกต์ที่มีหลายไฟล์
 
 ### Module C: Systems Programming
 
@@ -272,6 +346,7 @@ Module K ปิดท้ายด้วยโปรเจกต์ใหญ่ 4
 - [ ] เขียน TCP Server ที่รองรับหลาย client พร้อมกันโดยไม่มี Race Condition
 - [ ] ใช้ GDB ตั้ง Breakpoint และอ่าน Backtrace เพื่อหาสาเหตุของ Segmentation Fault ได้ด้วยตัวเอง
 - [ ] อธิบายว่าทำไม Valgrind ถึงตรวจจับ Use-After-Free ได้ในขณะที่โปรแกรมยังรันไม่พัง
+- [ ] อธิบายความแตกต่างระหว่าง Deadlock กับ Race Condition พร้อมยกตัวอย่างโค้ดที่ทำให้เกิดแต่ละแบบ
 
 ### Module D-E: OOP, Template และ STL
 
@@ -279,6 +354,7 @@ Module K ปิดท้ายด้วยโปรเจกต์ใหญ่ 4
 - [ ] อธิบายได้ว่า **RAII ป้องกัน Resource Leak ได้อย่างไร** แม้เกิด Exception กลางฟังก์ชัน
 - [ ] เลือกใช้ `std::vector`, `std::map`, `std::unordered_map` ได้ถูกต้องตาม use case พร้อมอธิบาย trade-off
 - [ ] เขียน Function Template และ Class Template ของตัวเองได้โดยไม่ต้องเปิดอ้างอิง
+- [ ] อธิบายความแตกต่างระหว่าง `unique_ptr`, `shared_ptr`, และ `weak_ptr` พร้อมบอกได้ว่าเมื่อไหร่ควรใช้ตัวไหน
 
 ### Module F-G: Modern C++, Concurrency และ Performance
 
@@ -286,6 +362,7 @@ Module K ปิดท้ายด้วยโปรเจกต์ใหญ่ 4
 - [ ] Debug Data Race ในโปรแกรม multi-thread ได้ด้วย ThreadSanitizer (`-fsanitize=thread`)
 - [ ] อธิบาย C++ Memory Model เบื้องต้นและความแตกต่างของ `memory_order` แบบต่างๆ ใน `std::atomic`
 - [ ] วัด Performance ของโค้ดด้วย `<chrono>` หรือ Google Benchmark แล้วอธิบายผลลัพธ์ที่ได้อย่างมีเหตุผล
+- [ ] อธิบายว่าทำไม Data-Oriented Design (จัดเรียงข้อมูลแบบ Structure of Arrays) ถึงเร็วกว่า OOP แบบดั้งเดิมในบางสถานการณ์
 
 ### Module H-I: Build/Test/Tooling และ Web Development
 
@@ -293,6 +370,7 @@ Module K ปิดท้ายด้วยโปรเจกต์ใหญ่ 4
 - [ ] เขียน Unit Test ด้วย Google Test หรือ Catch2 ที่ครอบคลุมทั้ง normal case และ edge case
 - [ ] ตั้งค่า GitHub Actions ให้ build/test อัตโนมัติทุกครั้งที่ push โค้ด
 - [ ] **ได้ deploy C++ Web Service ตัวจริงอยู่หลัง Nginx Reverse Proxy ผ่าน Docker แล้วอย่างน้อย 1 ครั้ง**
+- [ ] ป้องกัน SQL Injection ในโค้ดที่คุยกับฐานข้อมูลได้ด้วย Prepared Statement ทุกจุดที่รับ input จากผู้ใช้
 
 ### Module J-K: Professional Practices และ Capstone
 
