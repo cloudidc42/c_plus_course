@@ -97,6 +97,45 @@ g++ -Wall -Wextra -Wpedantic -std=c++17 sort_compare.cpp -o sort_compare
 container ตรงๆ นี่คือเหตุผลที่ทำให้ algorithm เดียวใช้ได้กับทั้ง `std::vector`,
 `std::list`, `std::array`, หรือแม้แต่ raw array ได้โดยไม่ต้องเขียนแยกเวอร์ชัน
 
+**แต่ก็มีข้อจำกัดที่ต้องระวัง**: algorithm บางตัวต้องการ Iterator category
+ขั้นต่ำที่สูงกว่าตัวอื่น เช่น `std::sort` ต้องการ **Random Access Iterator**
+เท่านั้น (เพราะอัลกอริทึม Introsort ต้องกระโดดเข้าถึงตำแหน่งกลางๆ ของข้อมูลได้
+โดยตรงเพื่อความเร็วระดับ O(n log n)) การพยายามเรียก `std::sort` กับ
+`std::list::iterator` (ซึ่งเป็นแค่ Bidirectional Iterator ตามตารางใน Part 62)
+จะทำให้ **compile error ทันที** ไม่ใช่ error ตอนรันโปรแกรม:
+
+```cpp
+#include <cstdio>
+#include <list>
+
+int main(void) {
+    std::list<int> l = {5, 3, 8, 1, 9, 2};
+
+    // std::sort(l.begin(), l.end()); // ห้ามเขียนแบบนี้! ไม่ compile เพราะ list::iterator เป็นแค่ Bidirectional
+    l.sort(); // ใช้ member function sort() ของ list เองแทน (ออกแบบมาเฉพาะสำหรับ linked list โดยเฉพาะ)
+
+    for (int x : l) std::printf("%d ", x);
+    std::printf("\n");
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 list_sort.cpp -o list_sort
+./list_sort
+# 1 2 3 5 8 9
+```
+
+นี่คือเหตุผลที่ `std::list` (และ `std::forward_list`) มี **member function
+`sort()` ของตัวเอง** แยกต่างหากจาก `std::sort` ของ `<algorithm>` — เพราะ
+`std::list::sort()` ถูกออกแบบมาให้ทำงานกับโครงสร้าง Linked List โดยเฉพาะ (ใช้
+เทคนิค Merge Sort ที่จัดเรียง node โดยการสลับ pointer แทนที่จะสลับค่า) และให้
+ผลลัพธ์ O(n log n) ได้เช่นกัน โดยไม่ต้องพึ่ง Random Access Iterator เลย จำไว้ว่า
+**ถ้า compiler แจ้ง error ยาวๆ ที่พูดถึง iterator concept หรือ `operator-`/
+`operator+` ไม่มีให้ใช้ ให้สงสัยไว้ก่อนว่าอาจเป็นเพราะ Iterator category ของ
+container ที่ใช้ไม่ตรงกับที่ algorithm ต้องการ**
+
 ---
 
 ## 63.2 std::sort พร้อม Custom Comparator (Step 498)
@@ -175,6 +214,71 @@ container และคืนค่า `bool` ที่หมายถึง **"a
 Expression อย่างละเอียดทุกแง่มุม แต่ในที่นี้ให้เข้าใจแค่ว่ามันคือฟังก์ชันแบบ
 ไม่มีชื่อ (anonymous function) ที่นิยามและใช้งานได้ในบรรทัดเดียว สะดวกกว่าการ
 ต้องประกาศฟังก์ชันแยกไว้ข้างนอกมาก
+
+Comparator ยังใช้เรียง **หลายเงื่อนไขพร้อมกัน (Multi-key Sort)** ได้ด้วย เช่น
+เรียงตามคะแนนก่อน ถ้าคะแนนเท่ากันค่อยเรียงตามชื่อ:
+
+```cpp
+#include <cstdio>
+#include <vector>
+#include <algorithm>
+#include <string>
+
+struct Student {
+    std::string name;
+    int score;
+};
+
+int main(void) {
+    std::vector<Student> students = {
+        {"Somchai", 88},
+        {"Suda", 92},
+        {"Anan", 88},
+        {"Malee", 92},
+    };
+
+    // เรียงตามคะแนนมากไปน้อยก่อน ถ้าคะแนนเท่ากันให้เรียงตามชื่อ (a-z)
+    std::sort(students.begin(), students.end(), [](const Student& s1, const Student& s2) {
+        if (s1.score != s2.score) {
+            return s1.score > s2.score;
+        }
+        return s1.name < s2.name;
+    });
+
+    for (const auto& s : students) {
+        std::printf("%-8s %d\n", s.name.c_str(), s.score);
+    }
+
+    return 0;
+}
+```
+
+```bash
+g++ -Wall -Wextra -Wpedantic -std=c++17 multikey_sort.cpp -o multikey_sort
+./multikey_sort
+```
+
+ผลลัพธ์:
+
+```
+Malee    92
+Suda     92
+Anan     88
+Somchai  88
+```
+
+สังเกตว่า Malee กับ Suda คะแนนเท่ากัน (92) จึงเรียงตามชื่อ (a-z) ต่อ เช่นเดียวกับ
+Anan กับ Somchai (88) — เทคนิคนี้ (เช็คเงื่อนไขหลักก่อน ถ้าเท่ากันค่อยไปเช็ค
+เงื่อนไขรอง) ใช้ได้กับกี่เงื่อนไขก็ได้ตามต้องการ เพียงแค่เขียนซ้อน `if` ต่อกันไป
+
+**ข้อควรรู้เพิ่มเติม**: `std::sort` **ไม่รับประกัน** ว่าสมาชิกที่ถือว่า
+"เท่ากัน" ตาม comparator (เช่น คะแนนเท่ากันในตัวอย่างที่ยังไม่ได้เรียงตามชื่อ
+ต่อ) จะยังคงเรียงตามลำดับเดิมก่อน sort อยู่หรือไม่ (เรียกว่าไม่ **stable**)
+ถ้าต้องการการเรียงที่คงลำดับเดิมของสมาชิกที่เท่ากันไว้ (เช่น ต้องการเรียงตาม
+คะแนนอย่างเดียว แต่รักษาลำดับที่มาก่อนไว้สำหรับคนคะแนนเท่ากัน) ให้ใช้
+**`std::stable_sort`** แทน ซึ่งมี signature และวิธีใช้เหมือน `std::sort`
+ทุกประการ ต่างกันแค่การรับประกันความเสถียรของลำดับ (แลกมาด้วยประสิทธิภาพที่
+อาจช้ากว่าเล็กน้อยในบาง implementation)
 
 ---
 
